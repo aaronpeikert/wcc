@@ -1,6 +1,6 @@
 Encoding: UTF-8
 Package: wcc 
-Date: 2026-04-15
+Date: 2026-06-13
 Title: Windowed Cross Correlation
 Authors@R: c(person(c("Steven"), "Boker", email="smb3u@virginia.edu", role=c("aut","cre")),
     person("Minquan", "Xu", role="aut"),
@@ -42,5 +42,5 @@ Collate:
     'wccSurrogateDyads.R'
     'wccVectorField.R'
 Biarch: true
-Version: 0.3.2
+Version: 0.3.3
     
