@@ -1,0 +1,1 @@
+testSine     This demo file creates an array of 10 pairs of dyadic timeseries and then uses all of the functions in the wcc package to test them.

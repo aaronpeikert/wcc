@@ -1,0 +1,17 @@
+import(pheatmap)
+import(grid)
+import(gtable)
+importFrom("grDevices", "dev.off", "heat.colors", "pdf", "postscript")
+importFrom("graphics", "image", "lines")
+importFrom("stats", "ks.test", "loess", "predict", "quantile", "runif",
+         "spline", "var")
+importFrom("utils", "read.csv", "read.table", "write.csv")
+importFrom("stats", "cor")
+importFrom("graphics", "axis", "layout", "par")
+  
+# basic functions in the wcc library
+exportPattern("^wcc.+")
+
+useDynLib(wcc, .registration = TRUE)
+#export(windcross)
+
