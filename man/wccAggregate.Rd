@@ -24,7 +24,8 @@ This function runs \code{wccCalc} and peakpicking on a pair of time series and r
 
 \usage{
 wccAggregate(inSeries1=NA, inSeries2=NA, wMax=50, tMax=50, wInc=1, tInc=1, Lsize=8,
-     pspan=.25, type="Max", samplespersecond=1, windcross=TRUE, embedD=9) 
+     pspan=.25, type="Max", samplespersecond=1,
+     method=c("c", "cumr", "cumc", "r"), embedD=9, ...)
 }
 
 \arguments{
@@ -38,8 +39,9 @@ wccAggregate(inSeries1=NA, inSeries2=NA, wMax=50, tMax=50, wInc=1, tInc=1, Lsize
 \item{pspan}{A numeric specifying the amount of smoothing applied by the \code{\link{loess}} function within \code{wccPeakPick}  (default=.25).}
 \item{type}{A character string indicating whether a maximum, \sQuote{Max}, or minimum, \sQuote{Min}, should be detected by \code{wccPeakPick} (default="Max").}
 \item{samplespersecond}{A numeric indicating the sampling rate of the time series.  This will determine the units of the first derivative aggregate statistics. (default=1)}
-\item{windcross}{The default, \code{TRUE}, indicates that the compiled windcross binary is used.  If \code{FALSE} then native R code is used to calculate the windowed cross correlation.  The native R code is the most portable across many machines and operating systems.  However, the compiled windcross library runs about 2 times faster, so if the binary is available on your machine, it is recommended.}
+\item{method}{Backend passed through to \code{\link{wccCalc}}: \code{"c"} (default, original compiled windcross), \code{"r"} (original pure-R loop), \code{"cumc"} (cumulative-sum C backend), or \code{"cumr"} (cumulative-sum pure-R reference).  See \code{\link{wccCalc}} for details and the missing-data caveat for the \code{cum*} methods.}
 \item{embedD}{A numeric indicating the embedding dimension passed to GLLAEmbed to calculate derivatives of the peak picking lag timeseries.  The default (9) will provide a medium smooth at the cost of some loss of resolution in the timing of jumps in the second derivative.  The smallest legal value is 5, which provides less smoothing and the best time resolution.  If your sampling rate is low, then a smaller value of embedD is useful, while if your sampling rate is high, a larger value of embedD will provide better noise rejection by smoothing.}
+\item{...}{Reserved for the deprecated \code{windcross=TRUE/FALSE} argument, mapped to \code{method="c"} / \code{method="r"} with a warning.}
 }
 
 \details{
@@ -112,6 +114,6 @@ Boker, S. M., Rotondo, J. L., Xu, M., & King, K. (2002). Windowed cross-correlat
 tSeries1 <- sin(c(1:1000)/10) + rnorm(1000, mean=0, sd=.5)
 tSeries2 <- sin(c(1:1000)/15) + rnorm(1000, mean=0, sd=.5)
 wccAggregate(inSeries1=tSeries1, inSeries2=tSeries2, wMax=50, tMax=50, wInc=1, tInc=1,
-     Lsize=8, pspan=.25, type="Max", samplespersecond=10, windcross=TRUE)
+     Lsize=8, pspan=.25, type="Max", samplespersecond=10, method="c")
 
 }

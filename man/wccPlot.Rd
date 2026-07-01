@@ -23,9 +23,9 @@ This function plots a Windowed Cross Correlation heatmap.
 }
 
 \usage{
-wccPlot(inSeries1=NA, inSeries2=NA, startwindow=1, endwindow=200, wMax=50, tMax=50, 
-    wInc=1, tInc=1, Lsize=8, pspan=.25, type="Max", samplespersecond=1, windcross=TRUE,
-    vectorfield=TRUE) 
+wccPlot(inSeries1=NA, inSeries2=NA, startwindow=1, endwindow=200, wMax=50, tMax=50,
+    wInc=1, tInc=1, Lsize=8, pspan=.25, type="Max", samplespersecond=1,
+    method=c("c", "cumr", "cumc", "r"), ...)
 }
 
 \arguments{
@@ -37,13 +37,12 @@ wccPlot(inSeries1=NA, inSeries2=NA, startwindow=1, endwindow=200, wMax=50, tMax=
 \item{tMax}{The maximum number of samples to lag the windows (default=50).  The cross correlation is calculated for windows that are time lagged against each other, allowing for processes than require some time to evolve.  For instance, if the two time series are from motion capture of two individuals conversing with one another, the speaker's movements are likely to occur prior to the responses of the listener.  tMax should be set to be greater than the number of samples that represents the maximum time lag that is likely to occur. }
 \item{wInc}{The number of samples incremented between successive windows  (default=1).  This is most often set to 1.  If the sample rate is very high and the time series is long, wInc may be increased.  However, \code{wccCalc}'s maximum sensitivity to nonstationary change in the time series occurs when wInc is 1.}
 \item{tInc}{The number of samples incremented between successive lags  (default=1).  This is most often set to 1.  If the sample rate is high and the maximum lag is high then tInc may be increased.  However, \code{wccCalc}'s maximum sensitivity to changes in lags occurs when the tInc is set to 1.}
-\item{windcross}{The default (windcross=TRUE) indicates that the compiled windcross binary is used.  If windcross=FALSE uses native R code to calculate the windowed cross correlation. The native R code is the most portable across many machines and operating systems.  However, the compiled windcross library runs about 2 times faster, so if the binary is available on your machine, it is recommended.}
 \item{Lsize}{An integer specifying the width required for a peak to be identified by \code{wccPeakPick} (default=8).  An Lsize that is too small may find spurious peaks that are just noise, whereas an Lsize that is too large may miss actual peaks.}
 \item{pspan}{A numeric specifying the amount of smoothing applied by the \link{loess} function within \code{wccPeakPick}  (default=.25).}
 \item{type}{A character string indicating whether a maximum, \sQuote{Max}, or minimum, \sQuote{Min}, should be detected by \code{wccPeakPick} (default=\sQuote{Max}). If type=\sQuote{Zero} then a topographic map is generated rather than a line from wccPeakPick\code{wccPeakPick}.}
 \item{samplespersecond}{A numeric indicating the sampling rate of the time series.  This will determine the units of the first derivative aggregate statistics. (default=1)}
-\item{windcross}{The default \sQuote{TRUE} then the compiled windcross binary is used.  If \sQuote{FALSE} then native R code is used to calculate the windowed cross correlation.  The native R code is the most portable across many machines and operating systems.  However, the compiled windcross library runs about 2 times faster, so if the binary is available on your machine, it is recommended.}
-\item{vectorfield}{The default \sQuote{FALSE} indicates that a regular heatmap will be produced along with a line from \code{wccPeakPick}.  If \sQuote{vectorfield=TRUE} then wccVectorField is called and either a vectorField plot is produced (when type=\sQuote{Max} or type=\sQuote{Min}. If type=\sQuote{Zero} then topographic contours are plotted. )} 
+\item{method}{Backend passed through to \code{\link{wccCalc}}: \code{"c"} (default, original compiled windcross), \code{"r"} (original pure-R loop), \code{"cumc"} (cumulative-sum C backend), or \code{"cumr"} (cumulative-sum pure-R reference).  See \code{\link{wccCalc}} for details and the missing-data caveat for the \code{cum*} methods.}
+\item{...}{Reserved for the deprecated \code{windcross=TRUE/FALSE} argument, mapped to \code{method="c"} / \code{method="r"} with a warning.}
 }
 
 \details{
