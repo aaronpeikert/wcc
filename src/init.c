@@ -5,11 +5,15 @@
 extern SEXP windcross(SEXP inSeries1, SEXP inSeries2, SEXP wMax, SEXP tMax, SEXP wInc, SEXP tInc);
 extern SEXP windcrosscum(SEXP inSeries1, SEXP inSeries2, SEXP wMax, SEXP tMax, SEXP wInc, SEXP tInc);
 extern SEXP windcrosscum_batch(SEXP seriesArray1, SEXP seriesArray2, SEXP pairs, SEXP wMax, SEXP tMax, SEXP wInc, SEXP tInc);
+extern SEXP windcrosscum_cuda(SEXP inSeries1, SEXP inSeries2, SEXP wMax, SEXP tMax, SEXP wInc, SEXP tInc);
+extern SEXP windcrosscum_cuda_batch(SEXP seriesArray1, SEXP seriesArray2, SEXP pairs, SEXP wMax, SEXP tMax, SEXP wInc, SEXP tInc);
 
 static const R_CallMethodDef CallEntries[] = {
     {"windcross", (DL_FUNC) &windcross, 6},
     {"windcrosscum", (DL_FUNC) &windcrosscum, 6},
     {"windcrosscum_batch", (DL_FUNC) &windcrosscum_batch, 7},
+    {"windcrosscum_cuda", (DL_FUNC) &windcrosscum_cuda, 6},
+    {"windcrosscum_cuda_batch", (DL_FUNC) &windcrosscum_cuda_batch, 7},
     {NULL, NULL, 0}
 };
 
