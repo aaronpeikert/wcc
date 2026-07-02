@@ -29,6 +29,10 @@ Imports:
     pheatmap,
     grid,
     gtable
+Suggests:
+    knitr,
+    rmarkdown
+VignetteBuilder: knitr
 LazyLoad: yes
 LazyData: yes
 Collate:
