@@ -32,7 +32,7 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 
-#include <vector>
+#include <cstring>
 
 #include <R.h>
 #include <Rinternals.h>
@@ -49,6 +49,62 @@
                   cudaGetErrorString(err__));                             \
         }                                                                 \
     } while (0)
+
+#define CUBLAS_CHECK(call)                                                \
+    do {                                                                  \
+        cublasStatus_t st__ = (call);                                     \
+        if (st__ != CUBLAS_STATUS_SUCCESS) {                              \
+            error("cuBLAS error in %s at line %d (status %d)", __FILE__,  \
+                  __LINE__, (int) st__);                                  \
+        }                                                                 \
+    } while (0)
+
+/* ------------------------------------------------------------------ */
+/* Persistent per-process resources, reused across calls to amortize   */
+/* cudaMalloc/cudaFree, cublasCreate, and to route transfers through   */
+/* pinned memory.  All entry points run synchronously on the R main    */
+/* thread, so a single set of buffers is safe.  Grow-only; released at */
+/* process exit by the driver.                                         */
+
+enum {
+    BUF_IN1, BUF_IN2, BUF_XC1, BUF_XC2, BUF_CS1, BUF_CSQ1, BUF_CS2, BUF_CSQ2,
+    BUF_GRID, BUF_P1, BUF_P2, BUF_M, BUF_T2, BUF_IDX, BUF_VAL, BUF_COUNT
+};
+
+static void *devBufGet(int slot, size_t bytes) {
+    static void *buf[BUF_COUNT];
+    static size_t cap[BUF_COUNT];
+    if (cap[slot] < bytes) {
+        if (buf[slot]) cudaFree(buf[slot]);
+        buf[slot] = NULL;
+        cap[slot] = 0;
+        CUDA_CHECK(cudaMalloc(&buf[slot], bytes));
+        cap[slot] = bytes;
+    }
+    return buf[slot];
+}
+
+/* Pinned host staging buffer for uploads/downloads. */
+static void *hostStageGet(size_t bytes) {
+    static void *buf = NULL;
+    static size_t cap = 0;
+    if (cap < bytes) {
+        if (buf) cudaFreeHost(buf);
+        buf = NULL;
+        cap = 0;
+        CUDA_CHECK(cudaHostAlloc(&buf, bytes, cudaHostAllocDefault));
+        cap = bytes;
+    }
+    return buf;
+}
+
+static cublasHandle_t cublasHandleGet(void) {
+    static cublasHandle_t handle = NULL;
+    if (handle == NULL) {
+        CUBLAS_CHECK(cublasCreate(&handle));
+    }
+    return handle;
+}
 
 template <typename T> __device__ __forceinline__ T quietNaN();
 template <> __device__ __forceinline__ double quietNaN<double>() { return nan(""); }
@@ -175,7 +231,7 @@ __global__ void wccColumnKernel(const T *xc1All, const T *cs1All, const T *csq1A
                                 long n, long tStart, long windowSize,
                                 long windowIncrement, long lagIncrement,
                                 long nRow, long nCol, long centerCol0,
-                                T *out) {
+                                int zeroNaN, T *out) {
     long p = blockIdx.x;
     long c = blockIdx.y;
     int tid = threadIdx.x;
@@ -251,7 +307,8 @@ __global__ void wccColumnKernel(const T *xc1All, const T *cs1All, const T *csq1A
             T vara = W * qa - sa * sa;
             T num = W * sxy - sb * sa;
             T den = varb * vara;
-            outCol[k] = (den > T(0)) ? num / sqrt(den) : quietNaN<T>();
+            outCol[k] = (den > T(0)) ? num / sqrt(den)
+                                     : (zeroNaN ? T(0) : quietNaN<T>());
         }
         __syncthreads();
         cur = 1 - cur;
@@ -260,32 +317,41 @@ __global__ void wccColumnKernel(const T *xc1All, const T *cs1All, const T *csq1A
 
 /* ------------------------------------------------------------------ */
 /* Host-side helpers: move data between R's double arrays and device   */
-/* buffers of type T (narrowing/widening through a host staging buffer */
-/* on the FP32 path).                                                  */
+/* buffers of type T through the pinned staging buffer (which also     */
+/* performs the FP32 narrowing/widening).                              */
 
 static void uploadReal(double *dDst, const double *src, size_t count) {
-    CUDA_CHECK(cudaMemcpy(dDst, src, count * sizeof(double), cudaMemcpyHostToDevice));
+    double *stage = (double *) hostStageGet(count * sizeof(double));
+    memcpy(stage, src, count * sizeof(double));
+    CUDA_CHECK(cudaMemcpy(dDst, stage, count * sizeof(double), cudaMemcpyHostToDevice));
 }
 
 static void uploadReal(float *dDst, const double *src, size_t count) {
-    std::vector<float> tmp(count);
-    for (size_t i = 0; i < count; i++) tmp[i] = (float) src[i];
-    CUDA_CHECK(cudaMemcpy(dDst, tmp.data(), count * sizeof(float), cudaMemcpyHostToDevice));
+    float *stage = (float *) hostStageGet(count * sizeof(float));
+    for (size_t i = 0; i < count; i++) stage[i] = (float) src[i];
+    CUDA_CHECK(cudaMemcpy(dDst, stage, count * sizeof(float), cudaMemcpyHostToDevice));
 }
 
 static void downloadReal(double *dst, const double *dSrc, size_t count) {
-    CUDA_CHECK(cudaMemcpy(dst, dSrc, count * sizeof(double), cudaMemcpyDeviceToHost));
+    double *stage = (double *) hostStageGet(count * sizeof(double));
+    CUDA_CHECK(cudaMemcpy(stage, dSrc, count * sizeof(double), cudaMemcpyDeviceToHost));
+    memcpy(dst, stage, count * sizeof(double));
 }
 
 static void downloadReal(double *dst, const float *dSrc, size_t count) {
-    std::vector<float> tmp(count);
-    CUDA_CHECK(cudaMemcpy(tmp.data(), dSrc, count * sizeof(float), cudaMemcpyDeviceToHost));
-    for (size_t i = 0; i < count; i++) dst[i] = (double) tmp[i];
+    float *stage = (float *) hostStageGet(count * sizeof(float));
+    CUDA_CHECK(cudaMemcpy(stage, dSrc, count * sizeof(float), cudaMemcpyDeviceToHost));
+    for (size_t i = 0; i < count; i++) dst[i] = (double) stage[i];
 }
 
+/* Computes the batched WCC grid and leaves it resident on the device
+ * (BUF_GRID slot, nRow x nCol column-major slabs, one per pair).
+ * zeroNaN = 1 writes 0 instead of NaN for zero-variance windows (the
+ * substitution the fused pipeline needs before smoothing). */
 template <typename T>
-static SEXP windcrosscum_cuda_batch_impl(SEXP seriesArray1, SEXP seriesArray2, SEXP pairs,
-                                         SEXP wMax, SEXP tMax, SEXP wInc, SEXP tInc) {
+static T *wccGridDevice(SEXP seriesArray1, SEXP seriesArray2, SEXP pairs,
+                        SEXP wMax, SEXP tMax, SEXP wInc, SEXP tInc,
+                        int zeroNaN, long *nRowOut, long *nColOut, long *nPairsOut) {
     long D1 = nrows(seriesArray1);
     long D2 = nrows(seriesArray2);
     long n = ncols(seriesArray1);
@@ -323,32 +389,17 @@ static SEXP windcrosscum_cuda_batch_impl(SEXP seriesArray1, SEXP seriesArray2, S
               resCells * 8.0 / 1073741824.0);
     }
 
-    SEXP dims = PROTECT(allocVector(INTSXP, 3));
-    INTEGER(dims)[0] = (int) nRow;
-    INTEGER(dims)[1] = (int) nCol;
-    INTEGER(dims)[2] = (int) nPairs;
-    SEXP corResult = PROTECT(allocArray(REALSXP, dims));
-    double *out = REAL(corResult);
-
-    size_t nbSeries1 = (size_t) D1 * n * sizeof(T);
-    size_t nbSeries2 = (size_t) D2 * n * sizeof(T);
-    size_t nbScan1 = (size_t) D1 * (n + 1) * sizeof(T);
-    size_t nbScan2 = (size_t) D2 * (n + 1) * sizeof(T);
-    size_t nbOut = (size_t) nRow * nCol * nPairs * sizeof(T);
-
-    T *dIn1, *dIn2, *dXc1, *dXc2, *dCs1, *dCsq1, *dCs2, *dCsq2, *dOut;
-    int *dP1, *dP2;
-    CUDA_CHECK(cudaMalloc(&dIn1, nbSeries1));
-    CUDA_CHECK(cudaMalloc(&dIn2, nbSeries2));
-    CUDA_CHECK(cudaMalloc(&dXc1, nbSeries1));
-    CUDA_CHECK(cudaMalloc(&dXc2, nbSeries2));
-    CUDA_CHECK(cudaMalloc(&dCs1, nbScan1));
-    CUDA_CHECK(cudaMalloc(&dCsq1, nbScan1));
-    CUDA_CHECK(cudaMalloc(&dCs2, nbScan2));
-    CUDA_CHECK(cudaMalloc(&dCsq2, nbScan2));
-    CUDA_CHECK(cudaMalloc(&dOut, nbOut));
-    CUDA_CHECK(cudaMalloc(&dP1, (size_t) nPairs * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&dP2, (size_t) nPairs * sizeof(int)));
+    T *dIn1  = (T *) devBufGet(BUF_IN1, (size_t) D1 * n * sizeof(T));
+    T *dIn2  = (T *) devBufGet(BUF_IN2, (size_t) D2 * n * sizeof(T));
+    T *dXc1  = (T *) devBufGet(BUF_XC1, (size_t) D1 * n * sizeof(T));
+    T *dXc2  = (T *) devBufGet(BUF_XC2, (size_t) D2 * n * sizeof(T));
+    T *dCs1  = (T *) devBufGet(BUF_CS1, (size_t) D1 * (n + 1) * sizeof(T));
+    T *dCsq1 = (T *) devBufGet(BUF_CSQ1, (size_t) D1 * (n + 1) * sizeof(T));
+    T *dCs2  = (T *) devBufGet(BUF_CS2, (size_t) D2 * (n + 1) * sizeof(T));
+    T *dCsq2 = (T *) devBufGet(BUF_CSQ2, (size_t) D2 * (n + 1) * sizeof(T));
+    T *dOut  = (T *) devBufGet(BUF_GRID, (size_t) nRow * nCol * nPairs * sizeof(T));
+    int *dP1 = (int *) devBufGet(BUF_P1, (size_t) nPairs * sizeof(int));
+    int *dP2 = (int *) devBufGet(BUF_P2, (size_t) nPairs * sizeof(int));
 
     uploadReal(dIn1, REAL(seriesArray1), (size_t) D1 * n);
     uploadReal(dIn2, REAL(seriesArray2), (size_t) D2 * n);
@@ -363,14 +414,31 @@ static SEXP windcrosscum_cuda_batch_impl(SEXP seriesArray1, SEXP seriesArray2, S
     wccColumnKernel<<<grid, TPB>>>(dXc1, dCs1, dCsq1, dXc2, dCs2, dCsq2,
                                    dP1, dP2, n, tStart, windowSize,
                                    windowIncrement, lagIncrement,
-                                   nRow, nCol, centerCol0, dOut);
+                                   nRow, nCol, centerCol0, zeroNaN, dOut);
     CUDA_CHECK(cudaGetLastError());
 
-    downloadReal(out, dOut, (size_t) nRow * nCol * nPairs);
+    *nRowOut = nRow;
+    *nColOut = nCol;
+    *nPairsOut = nPairs;
+    return dOut;
+}
 
-    cudaFree(dP2); cudaFree(dP1); cudaFree(dOut);
-    cudaFree(dCsq2); cudaFree(dCs2); cudaFree(dCsq1); cudaFree(dCs1);
-    cudaFree(dXc2); cudaFree(dXc1); cudaFree(dIn2); cudaFree(dIn1);
+template <typename T>
+static SEXP windcrosscum_cuda_batch_impl(SEXP seriesArray1, SEXP seriesArray2, SEXP pairs,
+                                         SEXP wMax, SEXP tMax, SEXP wInc, SEXP tInc) {
+    long nRow, nCol, nPairs;
+    T *dOut = wccGridDevice<T>(seriesArray1, seriesArray2, pairs,
+                               wMax, tMax, wInc, tInc, 0,
+                               &nRow, &nCol, &nPairs);
+
+    SEXP dims = PROTECT(allocVector(INTSXP, 3));
+    INTEGER(dims)[0] = (int) nRow;
+    INTEGER(dims)[1] = (int) nCol;
+    INTEGER(dims)[2] = (int) nPairs;
+    SEXP corResult = PROTECT(allocArray(REALSXP, dims));
+    double *out = REAL(corResult);
+
+    downloadReal(out, dOut, (size_t) nRow * nCol * nPairs);
 
     /* NaN (zero-variance windows) -> R NA */
     long total = nRow * nCol * nPairs;
@@ -515,15 +583,6 @@ __global__ void peakSearchKernel(const T *T2, long nRow, long colLen,
 #undef T2AT
 }
 
-#define CUBLAS_CHECK(call)                                                \
-    do {                                                                  \
-        cublasStatus_t st__ = (call);                                     \
-        if (st__ != CUBLAS_STATUS_SUCCESS) {                              \
-            error("cuBLAS error in %s at line %d (status %d)", __FILE__,  \
-                  __LINE__, (int) st__);                                  \
-        }                                                                 \
-    } while (0)
-
 static cublasStatus_t gemmStridedBatched(cublasHandle_t handle,
                                          int nRow, int m, int colLen,
                                          const double *dGrids, const double *dM,
@@ -556,30 +615,33 @@ static cublasStatus_t gemmStridedBatched(cublasHandle_t handle,
         P);
 }
 
+/* Smooths + peak-searches P device-resident grids (dGrids, nRow x
+ * colLen column-major slabs).  Uploads M, runs the batched GEMM and the
+ * search kernel, downloads only the P x nRow index/value arrays, and
+ * returns list(index, value) with NaN -> NA. */
 template <typename T>
-static SEXP wccpeakpick_cuda_batch_impl(SEXP grids, SEXP M, long nRow, long colLen,
-                                        long P, long Lsize, int findMax) {
+static SEXP peakPickDevice(T *dGrids, SEXP M, long nRow, long colLen,
+                           long P, long Lsize, int findMax) {
     long m = 2 * colLen - 1;
+    double t2Cells = (double) nRow * (double) m * (double) P;
+    if (t2Cells > 2147483647.0) {
+        error("Smoothed array would need %.1f GB; split the pairs into smaller batches.",
+              t2Cells * 8.0 / 1073741824.0);
+    }
 
     SEXP outIndexS = PROTECT(allocVector(REALSXP, nRow * P));
     SEXP outValueS = PROTECT(allocVector(REALSXP, nRow * P));
 
-    T *dGrids, *dM, *dT2, *dIdx, *dVal;
-    CUDA_CHECK(cudaMalloc(&dGrids, (size_t) nRow * colLen * P * sizeof(T)));
-    CUDA_CHECK(cudaMalloc(&dM, (size_t) m * colLen * sizeof(T)));
-    CUDA_CHECK(cudaMalloc(&dT2, (size_t) nRow * m * P * sizeof(T)));
-    CUDA_CHECK(cudaMalloc(&dIdx, (size_t) nRow * P * sizeof(T)));
-    CUDA_CHECK(cudaMalloc(&dVal, (size_t) nRow * P * sizeof(T)));
+    T *dM   = (T *) devBufGet(BUF_M, (size_t) m * colLen * sizeof(T));
+    T *dT2  = (T *) devBufGet(BUF_T2, (size_t) nRow * m * P * sizeof(T));
+    T *dIdx = (T *) devBufGet(BUF_IDX, (size_t) nRow * P * sizeof(T));
+    T *dVal = (T *) devBufGet(BUF_VAL, (size_t) nRow * P * sizeof(T));
 
-    uploadReal(dGrids, REAL(grids), (size_t) nRow * colLen * P);
     uploadReal(dM, REAL(M), (size_t) m * colLen);
 
     /* T2[p] (nRow x m) = grid[p] (nRow x colLen) * M^T (colLen x m) */
-    cublasHandle_t handle;
-    CUBLAS_CHECK(cublasCreate(&handle));
-    CUBLAS_CHECK(gemmStridedBatched(handle, (int) nRow, (int) m, (int) colLen,
+    CUBLAS_CHECK(gemmStridedBatched(cublasHandleGet(), (int) nRow, (int) m, (int) colLen,
                                     dGrids, dM, dT2, (int) P));
-    cublasDestroy(handle);
 
     long total = nRow * P;
     long nBlocks = (total + TPB - 1) / TPB;
@@ -589,8 +651,6 @@ static SEXP wccpeakpick_cuda_batch_impl(SEXP grids, SEXP M, long nRow, long colL
 
     downloadReal(REAL(outIndexS), dIdx, (size_t) total);
     downloadReal(REAL(outValueS), dVal, (size_t) total);
-
-    cudaFree(dVal); cudaFree(dIdx); cudaFree(dT2); cudaFree(dM); cudaFree(dGrids);
 
     double *oi = REAL(outIndexS);
     double *ov = REAL(outValueS);
@@ -603,6 +663,14 @@ static SEXP wccpeakpick_cuda_batch_impl(SEXP grids, SEXP M, long nRow, long colL
     SET_VECTOR_ELT(res, 1, outValueS);
     UNPROTECT(3);
     return res;
+}
+
+template <typename T>
+static SEXP wccpeakpick_cuda_batch_impl(SEXP grids, SEXP M, long nRow, long colLen,
+                                        long P, long Lsize, int findMax) {
+    T *dGrids = (T *) devBufGet(BUF_GRID, (size_t) nRow * colLen * P * sizeof(T));
+    uploadReal(dGrids, REAL(grids), (size_t) nRow * colLen * P);
+    return peakPickDevice<T>(dGrids, M, nRow, colLen, P, Lsize, findMax);
 }
 
 /* grids: nRow x colLen x P array; M: (2*colLen-1) x colLen smoother
@@ -632,4 +700,52 @@ extern "C" SEXP wccpeakpick_cuda_batch(SEXP grids, SEXP M, SEXP LsizeS, SEXP isM
         return wccpeakpick_cuda_batch_impl<float>(grids, M, nRow, colLen, P, Lsize, findMax);
     }
     return wccpeakpick_cuda_batch_impl<double>(grids, M, nRow, colLen, P, Lsize, findMax);
+}
+
+/* ------------------------------------------------------------------ */
+/* Fused pipeline: WCC + peak pick without the grid ever leaving the   */
+/* device.  Zero-variance cells are written as 0 (matching the         */
+/* g[is.na(g)] <- 0 substitution of the two-step pipeline), the grid   */
+/* stays resident in BUF_GRID, and only the P x nRow index/value       */
+/* arrays cross back to the host.                                      */
+
+template <typename T>
+static SEXP wccpipeline_cuda_batch_impl(SEXP seriesArray1, SEXP seriesArray2, SEXP pairs,
+                                        SEXP wMax, SEXP tMax, SEXP wInc, SEXP tInc,
+                                        SEXP M, long Lsize, int findMax) {
+    long nRow, nCol, nPairs;
+    T *dGrid = wccGridDevice<T>(seriesArray1, seriesArray2, pairs,
+                                wMax, tMax, wInc, tInc, 1,
+                                &nRow, &nCol, &nPairs);
+    if (nrows(M) != 2 * nCol - 1 || ncols(M) != nCol) {
+        error("M must be a (2*nCol-1) x nCol matrix.");
+    }
+    return peakPickDevice<T>(dGrid, M, nRow, nCol, nPairs, Lsize, findMax);
+}
+
+/* seriesArray1/2: D x n double matrices; pairs: P x 2 integer matrix;
+ * M: (2*nCol-1) x nCol smoother matrix from wccSmoothMatrix; LsizeS,
+ * isMaxS: scalar numerics; singleS: 1 = FP32, 0 = FP64.
+ * Returns list(index, value), each of length nRow * P (NaN -> NA). */
+extern "C" SEXP wccpipeline_cuda_batch(SEXP seriesArray1, SEXP seriesArray2, SEXP pairs,
+                                       SEXP wMax, SEXP tMax, SEXP wInc, SEXP tInc,
+                                       SEXP M, SEXP LsizeS, SEXP isMaxS, SEXP singleS) {
+    if (!isReal(seriesArray1) || !isReal(seriesArray2) || !isMatrix(seriesArray1) || !isMatrix(seriesArray2)) {
+        error("seriesArray1 and seriesArray2 must be numeric matrices.");
+    }
+    if (!isInteger(pairs) || !isMatrix(pairs) || ncols(pairs) != 2) {
+        error("pairs must be an integer matrix with two columns.");
+    }
+    if (!isReal(M) || !isMatrix(M)) {
+        error("M must be a numeric matrix.");
+    }
+    long Lsize = (long) REAL(LsizeS)[0];
+    int findMax = (int) REAL(isMaxS)[0];
+
+    if (precisionIsSingle(singleS)) {
+        return wccpipeline_cuda_batch_impl<float>(seriesArray1, seriesArray2, pairs,
+                                                  wMax, tMax, wInc, tInc, M, Lsize, findMax);
+    }
+    return wccpipeline_cuda_batch_impl<double>(seriesArray1, seriesArray2, pairs,
+                                               wMax, tMax, wInc, tInc, M, Lsize, findMax);
 }
