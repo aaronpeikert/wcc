@@ -39,6 +39,7 @@ Collate:
     'GLLAfunctions.R'
     'wccCalc.R'
     'wccCalcBatch.R'
+    'wccCalcPeakBatch.R'
     'wccAggregate.R'
     'wccFindDyadParam.R'
     'wccHeatMap.R'
