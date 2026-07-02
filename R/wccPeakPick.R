@@ -171,33 +171,3 @@ wccPeakPick <- function(tAllCor=NA, Lsize=8, pspan=.25, type="Max") {
     return(list(maxIndex=tIndex, maxValue=tValue))
 }
 
-# ----------------------------------
-# Batched peak picking over a 3-D array of WCC grids (nRow x nCol x P).
-# method="cumc" runs the CPU path per slab.
-# Returns list(index, value): two nRow x P matrices.
-
-wccPeakPickBatch <- function(grids, Lsize=8, pspan=.25, type="Max", method=c("cumc")) {
-    method <- match.arg(method)
-    if (!is.array(grids) || length(dim(grids)) != 3) {
-        stop("grids must be a 3-dimensional array (nRow x nCol x P).")
-    }
-    nRow <- dim(grids)[1]
-    colLen <- dim(grids)[2]
-    P <- dim(grids)[3]
-    findMin <- (type=="Min" || type=="min")
-
-    index <- matrix(NA_real_, nrow=nRow, ncol=P)
-    value <- matrix(NA_real_, nrow=nRow, ncol=P)
-    for (p in 1:P) {
-        ppOut <- wccPeakPick(grids[,,p], Lsize=Lsize, pspan=pspan, type=type)
-        if (findMin) {
-            index[,p] <- ppOut$minIndex
-            value[,p] <- ppOut$minValue
-        }
-        else {
-            index[,p] <- ppOut$maxIndex
-            value[,p] <- ppOut$maxValue
-        }
-    }
-    list(index=index, value=value)
-}

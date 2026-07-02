@@ -101,19 +101,4 @@ stopifnot(!is.null(wcc:::.wccPeakPickCache[[key]]))
 t1 <- system.time(wcc:::wccSmoothMatrix(ncol(gridNA), 0.25))["elapsed"]
 stopifnot(t1 < 0.1)
 
-# wccPeakPickBatch (CPU path) must match per-slab wccPeakPick.
-singleGrids <- lapply(1:3, function(i) {
-    g <- wccCalc(makeSeries(n), makeSeries(n), wMax=50, tMax=50)
-    g[is.na(g)] <- 0
-    g
-})
-grids <- array(NA_real_, dim=c(nrow(singleGrids[[1]]), ncol(singleGrids[[1]]), 3))
-for (p in 1:3) grids[,,p] <- singleGrids[[p]]
-bp <- wccPeakPickBatch(grids, Lsize=8, pspan=.25, type="Max", method="cumc")
-for (p in 1:3) {
-    single <- wccPeakPick(grids[,,p], Lsize=8, pspan=.25, type="Max")
-    stopifnot(sameOrBothNA(bp$index[,p], single$maxIndex, tol=0),
-              sameOrBothNA(bp$value[,p], single$maxValue, tol=0))
-}
-
 cat("All wccPeakPick tests passed.\n")
