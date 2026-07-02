@@ -30,6 +30,11 @@ backend (many dyads, moderately long series). The comparison is:
 - **`cumcuda` pipeline** — new cumulative-sum CUDA backend, batched
   (`wccCalcBatch(..., method = "cumcuda")`), followed by the CUDA
   batched peak picker (`wccPeakPickBatch(..., method = "cumcuda")`).
+- **`cumcuda` FP32 pipeline** — same as above with
+  `precision = "single"`: all device arithmetic runs in FP32, which on
+  consumer GPUs (whose FP64 throughput is 1/32–1/64 of FP32) unlocks
+  most of the card. Results are accurate to roughly `1e-5` instead of
+  machine precision.
 
 Both stages of each pipeline are inside the `system.time()` block, so
 the reported numbers reflect what a user of `wccFindDyadParam` or a
@@ -172,6 +177,13 @@ if (cudaAvailable) {
         wccPeakPickBatch(g, Lsize = Lsize, pspan = pspan, type = "Max",
                          method = "cumcuda")
     })
+    invisible({
+        g <- wccCalcBatch(arr1[1:2, ], arr2[1:2, ], wMax = wMax, tMax = tMax,
+                          method = "cumcuda", precision = "single")
+        g[is.na(g)] <- 0
+        wccPeakPickBatch(g, Lsize = Lsize, pspan = pspan, type = "Max",
+                         method = "cumcuda", precision = "single")
+    })
 }
 ```
 
@@ -222,6 +234,25 @@ if (cudaAvailable) {
 tCumcuda
 ```
 
+**`cumcuda` FP32: the same GPU pipeline with `precision = "single"`**
+
+```{r time_cumcuda32}
+if (cudaAvailable) {
+    tCumcuda32 <- system.time({
+        gCumcuda32 <- wccCalcBatch(arr1, arr2, wMax = wMax, tMax = tMax,
+                                    method = "cumcuda", precision = "single")
+        gCumcuda32[is.na(gCumcuda32)] <- 0
+        outCumcuda32 <- wccPeakPickBatch(gCumcuda32, Lsize = Lsize, pspan = pspan,
+                                          type = "Max", method = "cumcuda",
+                                          precision = "single")
+    })["elapsed"]
+} else {
+    tCumcuda32 <- NA_real_
+    outCumcuda32 <- NULL
+}
+tCumcuda32
+```
+
 ## Correctness
 
 The two new pipelines should reproduce the legacy output up to
@@ -249,16 +280,32 @@ if (cudaAvailable) {
 }
 ```
 
+The FP32 pipeline trades machine precision for speed: peak *values*
+agree with the FP64 result to about `1e-5`, and peak *indices* match
+except on near-ties, where the picked position can shift by one
+half-step.
+
+```{r verify32}
+if (cudaAvailable) {
+    idxShift <- sum(abs(outCumcuda32$index - legacyOut$index) > 0, na.rm = TRUE)
+    cat(sprintf("legacy vs cumcuda FP32: max |Δ value| = %.2e   shifted indices: %d/%d\n",
+                max(abs(legacyOut$value - outCumcuda32$value), na.rm = TRUE),
+                idxShift, sum(!is.na(legacyOut$index))))
+}
+```
+
 ## Speedup summary
 
 ```{r summary_table, results='asis'}
 tab <- data.frame(
     pipeline = c("legacy: windcross + loess+spline peak-pick (looped)",
                  "cumc: wccCalcBatch + wccPeakPickBatch (CPU)",
-                 "cumcuda: wccCalcBatch + wccPeakPickBatch (GPU)"),
-    elapsed_s = c(tLegacy, tCumc, tCumcuda),
+                 "cumcuda: wccCalcBatch + wccPeakPickBatch (GPU, FP64)",
+                 "cumcuda FP32: same with precision = \"single\""),
+    elapsed_s = c(tLegacy, tCumc, tCumcuda, tCumcuda32),
     speedup_vs_legacy = c(1, tLegacy / tCumc,
-                          if (cudaAvailable) tLegacy / tCumcuda else NA_real_)
+                          if (cudaAvailable) tLegacy / tCumcuda else NA_real_,
+                          if (cudaAvailable) tLegacy / tCumcuda32 else NA_real_)
 )
 knitr::kable(tab, digits = c(0, 2, 1),
              caption = sprintf(
@@ -286,6 +333,12 @@ per (pair, output column) for the WCC kernel, one
 `cublasDgemmStridedBatched` call for the batched smoother, and one
 thread per (slab, row) for the peak search. Only the small
 `P × nRow` index and value arrays cross back to the host.
+
+`precision = "single"` adds a fourth layer on top of `cumcuda`: the
+inputs are narrowed to FP32 on the host (halving PCIe traffic and
+device memory), all kernels run in float, and the smoother GEMM becomes
+`cublasSgemmStridedBatched`. On consumer cards, where FP64 units are
+scarce, this is often the single largest lever in the whole pipeline.
 
 ## What determines your numbers
 

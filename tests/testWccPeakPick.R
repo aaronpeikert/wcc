@@ -113,4 +113,34 @@ for (p in 1:3) {
               sameOrBothNA(bp$value[,p], single$maxValue, tol=0))
 }
 
+# CUDA batch paths (FP64 and FP32) against the CPU batch result.
+cudaAvailable <- tryCatch({
+    wccCalc(rnorm(200), rnorm(200), wMax=20, tMax=20, method="cumcuda")
+    TRUE
+}, error = function(e) FALSE)
+
+if (cudaAvailable) {
+    bg <- wccPeakPickBatch(grids, Lsize=8, pspan=.25, type="Max", method="cumcuda")
+    stopifnot(sameOrBothNA(bg$index, bp$index, tol=0),
+              sameOrBothNA(bg$value, bp$value))
+
+    b32 <- wccPeakPickBatch(grids, Lsize=8, pspan=.25, type="Max",
+                            method="cumcuda", precision="single")
+    stopifnot(all(is.na(b32$index) == is.na(bp$index)))
+    # Peak values within FP32 tolerance everywhere.
+    stopifnot(all(abs(b32$value - bp$value) < 1e-4, na.rm=TRUE))
+    # Indices match except possibly on near-ties, where a shift of one
+    # half-step is acceptable.
+    idxDiff <- abs(b32$index - bp$index)
+    stopifnot(all(idxDiff <= 1, na.rm=TRUE))
+    nShift <- sum(idxDiff > 0, na.rm=TRUE)
+    cat(sprintf("FP32 peak pick: %d/%d indices shifted by one half-step\n",
+                nShift, sum(!is.na(idxDiff))))
+}
+
+# precision="single" must be rejected for method="cumc".
+res <- tryCatch({ wccPeakPickBatch(grids, method="cumc", precision="single"); "no error" },
+                error = function(e) "error")
+stopifnot(res == "error")
+
 cat("All wccPeakPick tests passed.\n")

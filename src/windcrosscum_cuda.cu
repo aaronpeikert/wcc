@@ -13,7 +13,10 @@
  *      column in O(1) each from the tile scan plus the per-series prefix
  *      sums.
  *
- * All arithmetic in FP64.  Missing data is not supported; the R wrapper
+ * All kernels are templated on the floating-point type: FP64 (default)
+ * or FP32 (precision = "single" on the R side; inputs are narrowed on
+ * the host, all device arithmetic runs in float, results are widened
+ * back to double for R).  Missing data is not supported; the R wrapper
  * rejects NA input.
  *
  * Shared-memory tiling: the time axis is processed in tiles of TILE_N
@@ -28,6 +31,8 @@
 
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+
+#include <vector>
 
 #include <R.h>
 #include <Rinternals.h>
@@ -45,14 +50,19 @@
         }                                                                 \
     } while (0)
 
+template <typename T> __device__ __forceinline__ T quietNaN();
+template <> __device__ __forceinline__ double quietNaN<double>() { return nan(""); }
+template <> __device__ __forceinline__ float  quietNaN<float>()  { return nanf(""); }
+
 /* Block-wide inclusive scan of vals[TILE_N] in shared memory.
  * Each thread owns ITEMS_PER_THREAD consecutive elements.  partials must
- * hold TPB doubles.  After the call, vals contains the inclusive scan. */
-__device__ void blockScanTile(double *vals, double *partials) {
+ * hold TPB elements.  After the call, vals contains the inclusive scan. */
+template <typename T>
+__device__ void blockScanTile(T *vals, T *partials) {
     int tid = threadIdx.x;
     int base = tid * ITEMS_PER_THREAD;
     /* serial scan of this thread's chunk */
-    double sum = 0.0;
+    T sum = T(0);
     for (int i = 0; i < ITEMS_PER_THREAD; i++) {
         sum += vals[base + i];
         vals[base + i] = sum;
@@ -61,13 +71,13 @@ __device__ void blockScanTile(double *vals, double *partials) {
     __syncthreads();
     /* Hillis-Steele scan of the per-thread totals */
     for (int offset = 1; offset < TPB; offset <<= 1) {
-        double v = (tid >= offset) ? partials[tid - offset] : 0.0;
+        T v = (tid >= offset) ? partials[tid - offset] : T(0);
         __syncthreads();
         if (tid >= offset) partials[tid] += v;
         __syncthreads();
     }
     /* add the exclusive prefix of preceding chunks */
-    double chunkOffset = (tid > 0) ? partials[tid - 1] : 0.0;
+    T chunkOffset = (tid > 0) ? partials[tid - 1] : T(0);
     for (int i = 0; i < ITEMS_PER_THREAD; i++) {
         vals[base + i] += chunkOffset;
     }
@@ -78,22 +88,23 @@ __device__ void blockScanTile(double *vals, double *partials) {
  * matrix (stride D between samples).  Outputs (contiguous per series):
  * centered values xc (length n) and prefix sums cs, csq (length n+1,
  * leading zero). */
-__global__ void seriesScanKernel(const double *seriesMatrix, long D, long n,
-                                 double *xcAll, double *csAll, double *csqAll) {
+template <typename T>
+__global__ void seriesScanKernel(const T *seriesMatrix, long D, long n,
+                                 T *xcAll, T *csAll, T *csqAll) {
     long d = blockIdx.x;
     int tid = threadIdx.x;
-    const double *in = seriesMatrix + d;          /* sample t at in[D * t] */
-    double *xc  = xcAll + d * n;
-    double *cs  = csAll + d * (n + 1);
-    double *csq = csqAll + d * (n + 1);
+    const T *in = seriesMatrix + d;               /* sample t at in[D * t] */
+    T *xc  = xcAll + d * n;
+    T *cs  = csAll + d * (n + 1);
+    T *csq = csqAll + d * (n + 1);
 
-    __shared__ double partials[TPB];
-    __shared__ double tile[TILE_N];
-    __shared__ double carry2[2];                  /* running prefix: sum, sumsq */
-    __shared__ double meanSh;
+    __shared__ T partials[TPB];
+    __shared__ T tile[TILE_N];
+    __shared__ T carry2[2];                       /* running prefix: sum, sumsq */
+    __shared__ T meanSh;
 
     /* pass 1: mean */
-    double s = 0.0;
+    T s = T(0);
     for (long t = tid; t < n; t += TPB) s += in[D * t];
     partials[tid] = s;
     __syncthreads();
@@ -102,21 +113,21 @@ __global__ void seriesScanKernel(const double *seriesMatrix, long D, long n,
         __syncthreads();
     }
     if (tid == 0) {
-        meanSh = partials[0] / (double) n;
-        cs[0] = 0.0;
-        csq[0] = 0.0;
-        carry2[0] = 0.0;
-        carry2[1] = 0.0;
+        meanSh = partials[0] / (T) n;
+        cs[0] = T(0);
+        csq[0] = T(0);
+        carry2[0] = T(0);
+        carry2[1] = T(0);
     }
     __syncthreads();
-    double mean = meanSh;
+    T mean = meanSh;
 
     /* pass 2: center + tiled scans of values and squares */
     for (long tileStart = 0; tileStart < n; tileStart += TILE_N) {
         /* values */
         for (int i = tid; i < TILE_N; i += TPB) {
             long t = tileStart + i;
-            double v = (t < n) ? (in[D * t] - mean) : 0.0;
+            T v = (t < n) ? (in[D * t] - mean) : T(0);
             if (t < n) xc[t] = v;
             tile[i] = v;
         }
@@ -133,7 +144,7 @@ __global__ void seriesScanKernel(const double *seriesMatrix, long D, long n,
         /* squares */
         for (int i = tid; i < TILE_N; i += TPB) {
             long t = tileStart + i;
-            double v = (t < n) ? xc[t] : 0.0;
+            T v = (t < n) ? xc[t] : T(0);
             tile[i] = v * v;
         }
         __syncthreads();
@@ -157,13 +168,14 @@ __global__ void seriesScanKernel(const double *seriesMatrix, long D, long n,
  * double buffer; window sums look back at most wMax (<= TILE_N) samples.
  * Inclusive product prefix P (P[t] = sum of products up to t): window
  * sum for prefix indices (lo, hi] is P[hi-1] - P[lo-1], with P[-1] = 0. */
-__global__ void wccColumnKernel(const double *xc1All, const double *cs1All, const double *csq1All,
-                                const double *xc2All, const double *cs2All, const double *csq2All,
+template <typename T>
+__global__ void wccColumnKernel(const T *xc1All, const T *cs1All, const T *csq1All,
+                                const T *xc2All, const T *cs2All, const T *csq2All,
                                 const int *pairs1, const int *pairs2,
                                 long n, long tStart, long windowSize,
                                 long windowIncrement, long lagIncrement,
                                 long nRow, long nCol, long centerCol0,
-                                double *out) {
+                                T *out) {
     long p = blockIdx.x;
     long c = blockIdx.y;
     int tid = threadIdx.x;
@@ -173,7 +185,7 @@ __global__ void wccColumnKernel(const double *xc1All, const double *cs1All, cons
     long o = c - centerCol0;
     long L = (o >= 0 ? o : -o) * lagIncrement;
 
-    const double *base, *lagged, *csB, *csB2, *csA, *csA2;
+    const T *base, *lagged, *csB, *csB2, *csA, *csA2;
     if (o >= 0) {
         base = xc1All + d1 * n;  csB = cs1All + d1 * (n + 1);  csB2 = csq1All + d1 * (n + 1);
         lagged = xc2All + d2 * n;  csA = cs2All + d2 * (n + 1);  csA2 = csq2All + d2 * (n + 1);
@@ -181,24 +193,24 @@ __global__ void wccColumnKernel(const double *xc1All, const double *cs1All, cons
         base = xc2All + d2 * n;  csB = cs2All + d2 * (n + 1);  csB2 = csq2All + d2 * (n + 1);
         lagged = xc1All + d1 * n;  csA = cs1All + d1 * (n + 1);  csA2 = csq1All + d1 * (n + 1);
     }
-    double *outCol = out + p * nRow * nCol + c * nRow;
-    double W = (double) windowSize;
+    T *outCol = out + p * nRow * nCol + c * nRow;
+    T W = (T) windowSize;
 
-    __shared__ double partials[TPB];
-    __shared__ double buf[2][TILE_N];   /* current and previous tile of P */
-    __shared__ double carrySh;
-    if (tid == 0) carrySh = 0.0;
+    __shared__ T partials[TPB];
+    __shared__ T buf[2][TILE_N];        /* current and previous tile of P */
+    __shared__ T carrySh;
+    if (tid == 0) carrySh = T(0);
     __syncthreads();
 
     int cur = 0;
     for (long tileStart = 0; tileStart < n; tileStart += TILE_N) {
-        double *tile = buf[cur];
-        double *prev = buf[1 - cur];
-        double carry = carrySh;
+        T *tile = buf[cur];
+        T *prev = buf[1 - cur];
+        T carry = carrySh;
 
         for (int i = tid; i < TILE_N; i += TPB) {
             long t = tileStart + i;
-            tile[i] = (t < n && t >= L) ? base[t] * lagged[t - L] : 0.0;
+            tile[i] = (t < n && t >= L) ? base[t] * lagged[t - L] : T(0);
         }
         __syncthreads();
         blockScanTile(tile, partials);
@@ -221,40 +233,59 @@ __global__ void wccColumnKernel(const double *xc1All, const double *cs1All, cons
             long lo = hi - windowSize;
             long hiIdx = hi - 1 - tileStart;       /* in current tile by construction */
             long loIdx = lo - 1 - tileStart;       /* may fall in previous tile */
-            double Phi = tile[hiIdx];
-            double Plo;
+            T Phi = tile[hiIdx];
+            T Plo;
             if (lo - 1 < 0) {
-                Plo = 0.0;
+                Plo = T(0);
             } else if (loIdx >= 0) {
                 Plo = tile[loIdx];
             } else {
                 Plo = prev[loIdx + TILE_N];
             }
-            double sxy = Phi - Plo;
-            double sb  = csB[hi] - csB[lo];
-            double qb  = csB2[hi] - csB2[lo];
-            double sa  = csA[hi - L] - csA[lo - L];
-            double qa  = csA2[hi - L] - csA2[lo - L];
-            double varb = W * qb - sb * sb;
-            double vara = W * qa - sa * sa;
-            double num = W * sxy - sb * sa;
-            double den = varb * vara;
-            outCol[k] = (den > 0.0) ? num / sqrt(den) : nan("");
+            T sxy = Phi - Plo;
+            T sb  = csB[hi] - csB[lo];
+            T qb  = csB2[hi] - csB2[lo];
+            T sa  = csA[hi - L] - csA[lo - L];
+            T qa  = csA2[hi - L] - csA2[lo - L];
+            T varb = W * qb - sb * sb;
+            T vara = W * qa - sa * sa;
+            T num = W * sxy - sb * sa;
+            T den = varb * vara;
+            outCol[k] = (den > T(0)) ? num / sqrt(den) : quietNaN<T>();
         }
         __syncthreads();
         cur = 1 - cur;
     }
 }
 
-extern "C" SEXP windcrosscum_cuda_batch(SEXP seriesArray1, SEXP seriesArray2, SEXP pairs,
-                                        SEXP wMax, SEXP tMax, SEXP wInc, SEXP tInc) {
-    if (!isReal(seriesArray1) || !isReal(seriesArray2) || !isMatrix(seriesArray1) || !isMatrix(seriesArray2)) {
-        error("seriesArray1 and seriesArray2 must be numeric matrices.");
-    }
-    if (!isInteger(pairs) || !isMatrix(pairs) || ncols(pairs) != 2) {
-        error("pairs must be an integer matrix with two columns.");
-    }
+/* ------------------------------------------------------------------ */
+/* Host-side helpers: move data between R's double arrays and device   */
+/* buffers of type T (narrowing/widening through a host staging buffer */
+/* on the FP32 path).                                                  */
 
+static void uploadReal(double *dDst, const double *src, size_t count) {
+    CUDA_CHECK(cudaMemcpy(dDst, src, count * sizeof(double), cudaMemcpyHostToDevice));
+}
+
+static void uploadReal(float *dDst, const double *src, size_t count) {
+    std::vector<float> tmp(count);
+    for (size_t i = 0; i < count; i++) tmp[i] = (float) src[i];
+    CUDA_CHECK(cudaMemcpy(dDst, tmp.data(), count * sizeof(float), cudaMemcpyHostToDevice));
+}
+
+static void downloadReal(double *dst, const double *dSrc, size_t count) {
+    CUDA_CHECK(cudaMemcpy(dst, dSrc, count * sizeof(double), cudaMemcpyDeviceToHost));
+}
+
+static void downloadReal(double *dst, const float *dSrc, size_t count) {
+    std::vector<float> tmp(count);
+    CUDA_CHECK(cudaMemcpy(tmp.data(), dSrc, count * sizeof(float), cudaMemcpyDeviceToHost));
+    for (size_t i = 0; i < count; i++) dst[i] = (double) tmp[i];
+}
+
+template <typename T>
+static SEXP windcrosscum_cuda_batch_impl(SEXP seriesArray1, SEXP seriesArray2, SEXP pairs,
+                                         SEXP wMax, SEXP tMax, SEXP wInc, SEXP tInc) {
     long D1 = nrows(seriesArray1);
     long D2 = nrows(seriesArray2);
     long n = ncols(seriesArray1);
@@ -299,13 +330,13 @@ extern "C" SEXP windcrosscum_cuda_batch(SEXP seriesArray1, SEXP seriesArray2, SE
     SEXP corResult = PROTECT(allocArray(REALSXP, dims));
     double *out = REAL(corResult);
 
-    size_t nbSeries1 = (size_t) D1 * n * sizeof(double);
-    size_t nbSeries2 = (size_t) D2 * n * sizeof(double);
-    size_t nbScan1 = (size_t) D1 * (n + 1) * sizeof(double);
-    size_t nbScan2 = (size_t) D2 * (n + 1) * sizeof(double);
-    size_t nbOut = (size_t) nRow * nCol * nPairs * sizeof(double);
+    size_t nbSeries1 = (size_t) D1 * n * sizeof(T);
+    size_t nbSeries2 = (size_t) D2 * n * sizeof(T);
+    size_t nbScan1 = (size_t) D1 * (n + 1) * sizeof(T);
+    size_t nbScan2 = (size_t) D2 * (n + 1) * sizeof(T);
+    size_t nbOut = (size_t) nRow * nCol * nPairs * sizeof(T);
 
-    double *dIn1, *dIn2, *dXc1, *dXc2, *dCs1, *dCsq1, *dCs2, *dCsq2, *dOut;
+    T *dIn1, *dIn2, *dXc1, *dXc2, *dCs1, *dCsq1, *dCs2, *dCsq2, *dOut;
     int *dP1, *dP2;
     CUDA_CHECK(cudaMalloc(&dIn1, nbSeries1));
     CUDA_CHECK(cudaMalloc(&dIn2, nbSeries2));
@@ -319,8 +350,8 @@ extern "C" SEXP windcrosscum_cuda_batch(SEXP seriesArray1, SEXP seriesArray2, SE
     CUDA_CHECK(cudaMalloc(&dP1, (size_t) nPairs * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&dP2, (size_t) nPairs * sizeof(int)));
 
-    CUDA_CHECK(cudaMemcpy(dIn1, REAL(seriesArray1), nbSeries1, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dIn2, REAL(seriesArray2), nbSeries2, cudaMemcpyHostToDevice));
+    uploadReal(dIn1, REAL(seriesArray1), (size_t) D1 * n);
+    uploadReal(dIn2, REAL(seriesArray2), (size_t) D2 * n);
     CUDA_CHECK(cudaMemcpy(dP1, pairIdx, (size_t) nPairs * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(dP2, pairIdx + nPairs, (size_t) nPairs * sizeof(int), cudaMemcpyHostToDevice));
 
@@ -335,7 +366,7 @@ extern "C" SEXP windcrosscum_cuda_batch(SEXP seriesArray1, SEXP seriesArray2, SE
                                    nRow, nCol, centerCol0, dOut);
     CUDA_CHECK(cudaGetLastError());
 
-    CUDA_CHECK(cudaMemcpy(out, dOut, nbOut, cudaMemcpyDeviceToHost));
+    downloadReal(out, dOut, (size_t) nRow * nCol * nPairs);
 
     cudaFree(dP2); cudaFree(dP1); cudaFree(dOut);
     cudaFree(dCsq2); cudaFree(dCs2); cudaFree(dCsq1); cudaFree(dCs1);
@@ -351,9 +382,33 @@ extern "C" SEXP windcrosscum_cuda_batch(SEXP seriesArray1, SEXP seriesArray2, SE
     return corResult;
 }
 
+static int precisionIsSingle(SEXP singleS) {
+    if (!isInteger(singleS) && !isLogical(singleS) && !isReal(singleS)) {
+        error("precision flag must be a scalar.");
+    }
+    return asInteger(singleS) != 0;
+}
+
+extern "C" SEXP windcrosscum_cuda_batch(SEXP seriesArray1, SEXP seriesArray2, SEXP pairs,
+                                        SEXP wMax, SEXP tMax, SEXP wInc, SEXP tInc,
+                                        SEXP singleS) {
+    if (!isReal(seriesArray1) || !isReal(seriesArray2) || !isMatrix(seriesArray1) || !isMatrix(seriesArray2)) {
+        error("seriesArray1 and seriesArray2 must be numeric matrices.");
+    }
+    if (!isInteger(pairs) || !isMatrix(pairs) || ncols(pairs) != 2) {
+        error("pairs must be an integer matrix with two columns.");
+    }
+    if (precisionIsSingle(singleS)) {
+        return windcrosscum_cuda_batch_impl<float>(seriesArray1, seriesArray2, pairs,
+                                                   wMax, tMax, wInc, tInc);
+    }
+    return windcrosscum_cuda_batch_impl<double>(seriesArray1, seriesArray2, pairs,
+                                                wMax, tMax, wInc, tInc);
+}
+
 /* Single-dyad entry point: shim over the batch routine with one (1, 1) pair. */
 extern "C" SEXP windcrosscum_cuda(SEXP inSeries1, SEXP inSeries2, SEXP wMax,
-                                  SEXP tMax, SEXP wInc, SEXP tInc) {
+                                  SEXP tMax, SEXP wInc, SEXP tInc, SEXP singleS) {
     if (!isReal(inSeries1) || !isReal(inSeries2)) {
         error("inSeries1 and inSeries2 must be numeric.");
     }
@@ -370,7 +425,7 @@ extern "C" SEXP windcrosscum_cuda(SEXP inSeries1, SEXP inSeries2, SEXP wMax,
     INTEGER(onePair)[0] = 1;
     INTEGER(onePair)[1] = 1;
 
-    SEXP res3d = PROTECT(windcrosscum_cuda_batch(m1, m2, onePair, wMax, tMax, wInc, tInc));
+    SEXP res3d = PROTECT(windcrosscum_cuda_batch(m1, m2, onePair, wMax, tMax, wInc, tInc, singleS));
 
     int *d = INTEGER(getAttrib(res3d, R_DimSymbol));
     SEXP corResult = PROTECT(allocMatrix(REALSXP, d[0], d[1]));
@@ -398,34 +453,35 @@ extern "C" SEXP windcrosscum_cuda(SEXP inSeries1, SEXP inSeries2, SEXP wMax,
  * Lsize consecutive non-improvements stop the search; first index in
  * the final window matching the running max gives the peak position;
  * positions beyond colLen - Lsize - 1 fail to NaN. */
-__global__ void peakSearchKernel(const double *T2, long nRow, long colLen,
+template <typename T>
+__global__ void peakSearchKernel(const T *T2, long nRow, long colLen,
                                  long P, long Lsize, int findMax,
-                                 double *outIndex, double *outValue) {
+                                 T *outIndex, T *outValue) {
     long g = (long) blockIdx.x * blockDim.x + threadIdx.x;
     if (g >= nRow * P) return;
     long p = g / nRow;
     long r = g % nRow;
     long m = 2 * colLen - 1;
-    const double *slab = T2 + p * nRow * m;
+    const T *slab = T2 + p * nRow * m;
     long c0 = colLen - 1;
-    double sign = findMax ? 1.0 : -1.0;
+    T sign = findMax ? T(1) : T(-1);
 
 #define T2AT(j) (sign * slab[r + nRow * (j)])
 
     /* expanding-window maxima with look-ahead, computed on the fly:
      * window half-width j keeps running maxima of the left and right
      * arms, so mx[j] needs only two new reads per step. */
-    double lv = T2AT(c0);
-    double rv = lv;
-    double mmx = 0.0;
+    T lv = T2AT(c0);
+    T rv = lv;
+    T mmx = T(0);
     long lookAhead = 0;
     long windowWidth = colLen - 1;
     for (long j = 1; j <= colLen - 1; j++) {
-        double a = T2AT(c0 - j);
-        double b = T2AT(c0 + j);
+        T a = T2AT(c0 - j);
+        T b = T2AT(c0 + j);
         if (a > lv) lv = a;
         if (b > rv) rv = b;
-        double mx = (lv > rv) ? lv : rv;
+        T mx = (lv > rv) ? lv : rv;
         if (j == 1) {
             mmx = mx;
         } else if (mx > mmx) {
@@ -450,10 +506,10 @@ __global__ void peakSearchKernel(const double *T2, long nRow, long colLen,
     }
     long position = index - c0;
     if (position > (colLen - Lsize - 1) || position < -(colLen - Lsize - 1)) {
-        outIndex[g] = nan("");
-        outValue[g] = nan("");
+        outIndex[g] = quietNaN<T>();
+        outValue[g] = quietNaN<T>();
     } else {
-        outIndex[g] = (double) position;
+        outIndex[g] = (T) position;
         outValue[g] = sign * mmx;
     }
 #undef T2AT
@@ -468,10 +524,93 @@ __global__ void peakSearchKernel(const double *T2, long nRow, long colLen,
         }                                                                 \
     } while (0)
 
+static cublasStatus_t gemmStridedBatched(cublasHandle_t handle,
+                                         int nRow, int m, int colLen,
+                                         const double *dGrids, const double *dM,
+                                         double *dT2, int P) {
+    const double one = 1.0, zero = 0.0;
+    return cublasDgemmStridedBatched(handle,
+        CUBLAS_OP_N, CUBLAS_OP_T,
+        nRow, m, colLen,
+        &one,
+        dGrids, nRow, (long long) nRow * colLen,
+        dM, m, 0,
+        &zero,
+        dT2, nRow, (long long) nRow * m,
+        P);
+}
+
+static cublasStatus_t gemmStridedBatched(cublasHandle_t handle,
+                                         int nRow, int m, int colLen,
+                                         const float *dGrids, const float *dM,
+                                         float *dT2, int P) {
+    const float one = 1.0f, zero = 0.0f;
+    return cublasSgemmStridedBatched(handle,
+        CUBLAS_OP_N, CUBLAS_OP_T,
+        nRow, m, colLen,
+        &one,
+        dGrids, nRow, (long long) nRow * colLen,
+        dM, m, 0,
+        &zero,
+        dT2, nRow, (long long) nRow * m,
+        P);
+}
+
+template <typename T>
+static SEXP wccpeakpick_cuda_batch_impl(SEXP grids, SEXP M, long nRow, long colLen,
+                                        long P, long Lsize, int findMax) {
+    long m = 2 * colLen - 1;
+
+    SEXP outIndexS = PROTECT(allocVector(REALSXP, nRow * P));
+    SEXP outValueS = PROTECT(allocVector(REALSXP, nRow * P));
+
+    T *dGrids, *dM, *dT2, *dIdx, *dVal;
+    CUDA_CHECK(cudaMalloc(&dGrids, (size_t) nRow * colLen * P * sizeof(T)));
+    CUDA_CHECK(cudaMalloc(&dM, (size_t) m * colLen * sizeof(T)));
+    CUDA_CHECK(cudaMalloc(&dT2, (size_t) nRow * m * P * sizeof(T)));
+    CUDA_CHECK(cudaMalloc(&dIdx, (size_t) nRow * P * sizeof(T)));
+    CUDA_CHECK(cudaMalloc(&dVal, (size_t) nRow * P * sizeof(T)));
+
+    uploadReal(dGrids, REAL(grids), (size_t) nRow * colLen * P);
+    uploadReal(dM, REAL(M), (size_t) m * colLen);
+
+    /* T2[p] (nRow x m) = grid[p] (nRow x colLen) * M^T (colLen x m) */
+    cublasHandle_t handle;
+    CUBLAS_CHECK(cublasCreate(&handle));
+    CUBLAS_CHECK(gemmStridedBatched(handle, (int) nRow, (int) m, (int) colLen,
+                                    dGrids, dM, dT2, (int) P));
+    cublasDestroy(handle);
+
+    long total = nRow * P;
+    long nBlocks = (total + TPB - 1) / TPB;
+    peakSearchKernel<<<(unsigned) nBlocks, TPB>>>(dT2, nRow, colLen, P, Lsize, findMax,
+                                                  dIdx, dVal);
+    CUDA_CHECK(cudaGetLastError());
+
+    downloadReal(REAL(outIndexS), dIdx, (size_t) total);
+    downloadReal(REAL(outValueS), dVal, (size_t) total);
+
+    cudaFree(dVal); cudaFree(dIdx); cudaFree(dT2); cudaFree(dM); cudaFree(dGrids);
+
+    double *oi = REAL(outIndexS);
+    double *ov = REAL(outValueS);
+    for (long j = 0; j < total; j++) {
+        if (isnan(oi[j])) { oi[j] = NA_REAL; ov[j] = NA_REAL; }
+    }
+
+    SEXP res = PROTECT(allocVector(VECSXP, 2));
+    SET_VECTOR_ELT(res, 0, outIndexS);
+    SET_VECTOR_ELT(res, 1, outValueS);
+    UNPROTECT(3);
+    return res;
+}
+
 /* grids: nRow x colLen x P array; M: (2*colLen-1) x colLen smoother
- * matrix; LsizeS, isMaxS: scalar numerics.  Returns list(index, value),
- * each a numeric vector of length nRow * P (NaN -> NA). */
-extern "C" SEXP wccpeakpick_cuda_batch(SEXP grids, SEXP M, SEXP LsizeS, SEXP isMaxS) {
+ * matrix; LsizeS, isMaxS: scalar numerics; singleS: 1 = FP32, 0 = FP64.
+ * Returns list(index, value), each a numeric vector of length
+ * nRow * P (NaN -> NA). */
+extern "C" SEXP wccpeakpick_cuda_batch(SEXP grids, SEXP M, SEXP LsizeS, SEXP isMaxS,
+                                       SEXP singleS) {
     if (!isReal(grids) || !isReal(M)) {
         error("grids and M must be numeric.");
     }
@@ -489,54 +628,8 @@ extern "C" SEXP wccpeakpick_cuda_batch(SEXP grids, SEXP M, SEXP LsizeS, SEXP isM
     long Lsize = (long) REAL(LsizeS)[0];
     int findMax = (int) REAL(isMaxS)[0];
 
-    SEXP outIndexS = PROTECT(allocVector(REALSXP, nRow * P));
-    SEXP outValueS = PROTECT(allocVector(REALSXP, nRow * P));
-
-    double *dGrids, *dM, *dT2, *dIdx, *dVal;
-    CUDA_CHECK(cudaMalloc(&dGrids, (size_t) nRow * colLen * P * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&dM, (size_t) m * colLen * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&dT2, (size_t) nRow * m * P * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&dIdx, (size_t) nRow * P * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&dVal, (size_t) nRow * P * sizeof(double)));
-
-    CUDA_CHECK(cudaMemcpy(dGrids, REAL(grids), (size_t) nRow * colLen * P * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dM, REAL(M), (size_t) m * colLen * sizeof(double), cudaMemcpyHostToDevice));
-
-    /* T2[p] (nRow x m) = grid[p] (nRow x colLen) * M^T (colLen x m) */
-    cublasHandle_t handle;
-    CUBLAS_CHECK(cublasCreate(&handle));
-    const double one = 1.0, zero = 0.0;
-    CUBLAS_CHECK(cublasDgemmStridedBatched(handle,
-        CUBLAS_OP_N, CUBLAS_OP_T,
-        (int) nRow, (int) m, (int) colLen,
-        &one,
-        dGrids, (int) nRow, (long long) nRow * colLen,
-        dM, (int) m, 0,
-        &zero,
-        dT2, (int) nRow, (long long) nRow * m,
-        (int) P));
-    cublasDestroy(handle);
-
-    long total = nRow * P;
-    long nBlocks = (total + TPB - 1) / TPB;
-    peakSearchKernel<<<(unsigned) nBlocks, TPB>>>(dT2, nRow, colLen, P, Lsize, findMax,
-                                                  dIdx, dVal);
-    CUDA_CHECK(cudaGetLastError());
-
-    CUDA_CHECK(cudaMemcpy(REAL(outIndexS), dIdx, (size_t) total * sizeof(double), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(REAL(outValueS), dVal, (size_t) total * sizeof(double), cudaMemcpyDeviceToHost));
-
-    cudaFree(dVal); cudaFree(dIdx); cudaFree(dT2); cudaFree(dM); cudaFree(dGrids);
-
-    double *oi = REAL(outIndexS);
-    double *ov = REAL(outValueS);
-    for (long j = 0; j < total; j++) {
-        if (isnan(oi[j])) { oi[j] = NA_REAL; ov[j] = NA_REAL; }
+    if (precisionIsSingle(singleS)) {
+        return wccpeakpick_cuda_batch_impl<float>(grids, M, nRow, colLen, P, Lsize, findMax);
     }
-
-    SEXP res = PROTECT(allocVector(VECSXP, 2));
-    SET_VECTOR_ELT(res, 0, outIndexS);
-    SET_VECTOR_ELT(res, 1, outValueS);
-    UNPROTECT(3);
-    return res;
+    return wccpeakpick_cuda_batch_impl<double>(grids, M, nRow, colLen, P, Lsize, findMax);
 }

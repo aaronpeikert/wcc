@@ -24,7 +24,8 @@ Computes the Windowed Cross Correlation grid for a list of series pairs in one c
 
 \usage{
 wccCalcBatch(seriesArray1, seriesArray2, pairs=NULL,
-             wMax=50, tMax=50, wInc=1, tInc=1, method=c("cumc", "cumcuda"))
+             wMax=50, tMax=50, wInc=1, tInc=1, method=c("cumc", "cumcuda"),
+             precision=c("double", "single"))
 }
 
 \arguments{
@@ -36,6 +37,7 @@ wccCalcBatch(seriesArray1, seriesArray2, pairs=NULL,
 \item{wInc}{Window increment in samples (default=1).}
 \item{tInc}{Lag increment in samples (default=1).}
 \item{method}{Backend for the batched computation: \code{"cumc"} (default, batched cumulative-sum C backend) or \code{"cumcuda"} (batched CUDA backend, requires a CUDA-enabled build).}
+\item{precision}{Floating-point precision of the GPU computation; only valid with \code{method="cumcuda"}.  \code{"double"} (default) computes in FP64.  \code{"single"} computes in FP32, which is substantially faster on consumer GPUs at the cost of correlations accurate to roughly 1e-5 rather than machine precision.  Results are always returned as R doubles.}
 }
 
 \details{

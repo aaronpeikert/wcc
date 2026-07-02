@@ -23,7 +23,8 @@ Runs peak picking over a 3-D array of Windowed Cross Correlation grids and retur
 }
 
 \usage{
-wccPeakPickBatch(grids, Lsize=8, pspan=.25, type="Max", method=c("cumc", "cumcuda"))
+wccPeakPickBatch(grids, Lsize=8, pspan=.25, type="Max", method=c("cumc", "cumcuda"),
+                 precision=c("double", "single"))
 }
 
 \arguments{
@@ -32,6 +33,7 @@ wccPeakPickBatch(grids, Lsize=8, pspan=.25, type="Max", method=c("cumc", "cumcud
 \item{pspan}{A numeric specifying the amount of smoothing applied by the shared matrix smoother (default=0.25).}
 \item{type}{Either \code{"Max"} or \code{"Min"}, selecting peaks or valleys respectively.}
 \item{method}{Backend selector.  \code{"cumc"} (default) runs the CPU path per slab, reusing the cached matrix smoother.  \code{"cumcuda"} smooths all slabs with one batched GEMM on the GPU and runs the search kernel there (requires a CUDA-enabled build); NA cells must be replaced before calling.}
+\item{precision}{Floating-point precision of the GPU computation; only valid with \code{method="cumcuda"}.  \code{"double"} (default) computes in FP64.  \code{"single"} smooths and searches in FP32, which is substantially faster on consumer GPUs; peak values are then accurate to roughly 1e-5 and near-tied peak positions may occasionally shift by one half-step.  Results are always returned as R doubles.}
 }
 
 \value{

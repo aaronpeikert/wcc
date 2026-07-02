@@ -178,8 +178,13 @@ wccPeakPick <- function(tAllCor=NA, Lsize=8, pspan=.25, type="Max") {
 # GPU and runs the search kernel there (requires a CUDA-enabled build).
 # Returns list(index, value): two nRow x P matrices.
 
-wccPeakPickBatch <- function(grids, Lsize=8, pspan=.25, type="Max", method=c("cumc", "cumcuda")) {
+wccPeakPickBatch <- function(grids, Lsize=8, pspan=.25, type="Max", method=c("cumc", "cumcuda"),
+                             precision=c("double", "single")) {
     method <- match.arg(method)
+    precision <- match.arg(precision)
+    if (precision == "single" && method != "cumcuda") {
+        stop("precision=\"single\" is only supported with method=\"cumcuda\".")
+    }
     if (!is.array(grids) || length(dim(grids)) != 3) {
         stop("grids must be a 3-dimensional array (nRow x nCol x P).")
     }
@@ -194,7 +199,8 @@ wccPeakPickBatch <- function(grids, Lsize=8, pspan=.25, type="Max", method=c("cu
         }
         M <- wccSmoothMatrix(colLen, pspan)
         res <- .Call("wccpeakpick_cuda_batch", grids, M,
-                     as.numeric(Lsize), as.numeric(!findMin), PACKAGE = "wcc")
+                     as.numeric(Lsize), as.numeric(!findMin),
+                     as.integer(precision == "single"), PACKAGE = "wcc")
         return(list(index=matrix(res[[1]], nrow=nRow, ncol=P),
                     value=matrix(res[[2]], nrow=nRow, ncol=P)))
     }
