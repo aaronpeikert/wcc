@@ -35,6 +35,14 @@ backend (many dyads, moderately long series). The comparison is:
   consumer GPUs (whose FP64 throughput is 1/32–1/64 of FP32) unlocks
   most of the card. Results are accurate to roughly `1e-5` instead of
   machine precision.
+- **fused pipeline** — `wccCalcPeakBatch(..., method = "cumcuda")`:
+  both stages in one call, with the WCC grids resident on the GPU
+  throughout. The two-step GPU pipeline downloads the full
+  `nRow × nCol × P` grid array to R, zeroes the NAs there, and uploads
+  it again for the smoother GEMM; at this problem size that round trip
+  dominates the runtime, which is also why FP32 alone barely moves the
+  two-step numbers. The fused call transfers only the small
+  `nRow × P` index and value matrices. Timed in FP64 and FP32.
 
 Both stages of each pipeline are inside the `system.time()` block, so
 the reported numbers reflect what a user of `wccFindDyadParam` or a
@@ -184,6 +192,12 @@ if (cudaAvailable) {
         wccPeakPickBatch(g, Lsize = Lsize, pspan = pspan, type = "Max",
                          method = "cumcuda", precision = "single")
     })
+    invisible(wccCalcPeakBatch(arr1[1:2, ], arr2[1:2, ], wMax = wMax, tMax = tMax,
+                               Lsize = Lsize, pspan = pspan, type = "Max",
+                               method = "cumcuda"))
+    invisible(wccCalcPeakBatch(arr1[1:2, ], arr2[1:2, ], wMax = wMax, tMax = tMax,
+                               Lsize = Lsize, pspan = pspan, type = "Max",
+                               method = "cumcuda", precision = "single"))
 }
 ```
 
@@ -253,6 +267,39 @@ if (cudaAvailable) {
 tCumcuda32
 ```
 
+**Fused: `wccCalcPeakBatch(method = "cumcuda")` — grid stays on the GPU**
+
+```{r time_fused}
+if (cudaAvailable) {
+    tFused <- system.time({
+        outFused <- wccCalcPeakBatch(arr1, arr2, wMax = wMax, tMax = tMax,
+                                     Lsize = Lsize, pspan = pspan,
+                                     type = "Max", method = "cumcuda")
+    })["elapsed"]
+} else {
+    tFused <- NA_real_
+    outFused <- NULL
+}
+tFused
+```
+
+**Fused FP32: `wccCalcPeakBatch(..., precision = "single")`**
+
+```{r time_fused32}
+if (cudaAvailable) {
+    tFused32 <- system.time({
+        outFused32 <- wccCalcPeakBatch(arr1, arr2, wMax = wMax, tMax = tMax,
+                                       Lsize = Lsize, pspan = pspan,
+                                       type = "Max", method = "cumcuda",
+                                       precision = "single")
+    })["elapsed"]
+} else {
+    tFused32 <- NA_real_
+    outFused32 <- NULL
+}
+tFused32
+```
+
 ## Correctness
 
 The two new pipelines should reproduce the legacy output up to
@@ -294,6 +341,23 @@ if (cudaAvailable) {
 }
 ```
 
+The fused pipeline computes the same quantities as the two-step GPU
+pipeline (with the `NA → 0` substitution applied on the device), so it
+must agree with it — exactly in FP64, and up to the same near-tie
+caveat in FP32.
+
+```{r verify_fused}
+if (cudaAvailable) {
+    cat(sprintf("legacy vs fused:   max |Δ index| = %.2e   max |Δ value| = %.2e\n",
+                maxAbsDiff(legacyOut$index, outFused$index),
+                maxAbsDiff(legacyOut$value, outFused$value)))
+    idxShiftF <- sum(abs(outFused32$index - legacyOut$index) > 0, na.rm = TRUE)
+    cat(sprintf("legacy vs fused FP32: max |Δ value| = %.2e   shifted indices: %d/%d\n",
+                max(abs(legacyOut$value - outFused32$value), na.rm = TRUE),
+                idxShiftF, sum(!is.na(legacyOut$index))))
+}
+```
+
 ## Speedup summary
 
 ```{r summary_table, results='asis'}
@@ -301,11 +365,15 @@ tab <- data.frame(
     pipeline = c("legacy: windcross + loess+spline peak-pick (looped)",
                  "cumc: wccCalcBatch + wccPeakPickBatch (CPU)",
                  "cumcuda: wccCalcBatch + wccPeakPickBatch (GPU, FP64)",
-                 "cumcuda FP32: same with precision = \"single\""),
-    elapsed_s = c(tLegacy, tCumc, tCumcuda, tCumcuda32),
+                 "cumcuda FP32: same with precision = \"single\"",
+                 "fused: wccCalcPeakBatch (GPU, FP64, grid stays on device)",
+                 "fused FP32: wccCalcPeakBatch with precision = \"single\""),
+    elapsed_s = c(tLegacy, tCumc, tCumcuda, tCumcuda32, tFused, tFused32),
     speedup_vs_legacy = c(1, tLegacy / tCumc,
                           if (cudaAvailable) tLegacy / tCumcuda else NA_real_,
-                          if (cudaAvailable) tLegacy / tCumcuda32 else NA_real_)
+                          if (cudaAvailable) tLegacy / tCumcuda32 else NA_real_,
+                          if (cudaAvailable) tLegacy / tFused else NA_real_,
+                          if (cudaAvailable) tLegacy / tFused32 else NA_real_)
 )
 knitr::kable(tab, digits = c(0, 2, 1),
              caption = sprintf(
@@ -338,7 +406,23 @@ thread per (slab, row) for the peak search. Only the small
 inputs are narrowed to FP32 on the host (halving PCIe traffic and
 device memory), all kernels run in float, and the smoother GEMM becomes
 `cublasSgemmStridedBatched`. On consumer cards, where FP64 units are
-scarce, this is often the single largest lever in the whole pipeline.
+scarce, this raises the arithmetic ceiling — but as the two-step
+numbers above show, arithmetic is not the bottleneck at this problem
+size, so FP32 alone changes little.
+
+The **fused** `wccCalcPeakBatch` removes that bottleneck. In the
+two-step GPU pipeline the full grid array (`nRow × nCol × P` doubles,
+tens of MB here) is downloaded to R, scanned for NAs, and uploaded
+again — three passes over PCIe plus two host-side loops, for data the
+GPU already had. The fused call keeps the grids resident on the device
+(zero-variance cells are written as `0` directly, matching the
+`g[is.na(g)] <- 0` convention), runs the smoother GEMM and peak search
+in place, and downloads only the `nRow × P` index and value matrices.
+The backend also reuses its device buffers, cuBLAS handle, and pinned
+transfer staging across calls, which matters for repeated invocations
+in a parameter search. With transfers out of the way, FP32 finally has
+something to accelerate, which is why the fused FP32 row shows the
+largest gain.
 
 ## What determines your numbers
 
@@ -365,6 +449,9 @@ Rule of thumb for a parameter-search workload
   right default.
 - 100+ dyads, dense parameter grid, CUDA-capable machine:
   `method = "cumcuda"` moves a coffee-break workload to real time.
+  When you only need the peaks (not the grids themselves), call
+  `wccCalcPeakBatch` instead of the two-step pipeline, and add
+  `precision = "single"` on consumer cards.
 
 ## Session info
 
