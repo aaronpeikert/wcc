@@ -379,3 +379,164 @@ extern "C" SEXP windcrosscum_cuda(SEXP inSeries1, SEXP inSeries2, SEXP wMax,
     UNPROTECT(5);
     return corResult;
 }
+
+/* ------------------------------------------------------------------ */
+/* Batched peak picking.                                               */
+/*                                                                     */
+/* The loess+spline smoother is applied as a precomputed linear        */
+/* operator M ((2*colLen-1) x colLen, built and cached on the R side   */
+/* by wccSmoothMatrix): all P grids are smoothed with one strided-     */
+/* batched GEMM, T2[p] = grid[p] %*% t(M), then one thread per         */
+/* (grid, row) runs the expanding-window look-ahead search and writes  */
+/* peak index and value.  Only the P x nRow index/value arrays are     */
+/* downloaded.                                                         */
+
+/* One thread per (grid, row).  t2 row r of slab p is read column-wise
+ * from the GEMM output (column-major nRow x m per slab).  Replicates
+ * the R search: mx[j] = max over half-width-j window around the center
+ * (0-based c0 = colLen-1); strict improvements reset the look-ahead,
+ * Lsize consecutive non-improvements stop the search; first index in
+ * the final window matching the running max gives the peak position;
+ * positions beyond colLen - Lsize - 1 fail to NaN. */
+__global__ void peakSearchKernel(const double *T2, long nRow, long colLen,
+                                 long P, long Lsize, int findMax,
+                                 double *outIndex, double *outValue) {
+    long g = (long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= nRow * P) return;
+    long p = g / nRow;
+    long r = g % nRow;
+    long m = 2 * colLen - 1;
+    const double *slab = T2 + p * nRow * m;
+    long c0 = colLen - 1;
+    double sign = findMax ? 1.0 : -1.0;
+
+#define T2AT(j) (sign * slab[r + nRow * (j)])
+
+    /* expanding-window maxima with look-ahead, computed on the fly:
+     * window half-width j keeps running maxima of the left and right
+     * arms, so mx[j] needs only two new reads per step. */
+    double lv = T2AT(c0);
+    double rv = lv;
+    double mmx = 0.0;
+    long lookAhead = 0;
+    long windowWidth = colLen - 1;
+    for (long j = 1; j <= colLen - 1; j++) {
+        double a = T2AT(c0 - j);
+        double b = T2AT(c0 + j);
+        if (a > lv) lv = a;
+        if (b > rv) rv = b;
+        double mx = (lv > rv) ? lv : rv;
+        if (j == 1) {
+            mmx = mx;
+        } else if (mx > mmx) {
+            lookAhead = 0;
+            mmx = mx;
+        } else {
+            lookAhead++;
+            if (lookAhead >= Lsize) {
+                windowWidth = j;
+                break;
+            }
+        }
+    }
+
+    /* first match of mmx within the final window */
+    long index = -1;
+    for (long t = c0 - windowWidth; t <= c0 + windowWidth; t++) {
+        if (T2AT(t) == mmx) {
+            index = t;
+            break;
+        }
+    }
+    long position = index - c0;
+    if (position > (colLen - Lsize - 1) || position < -(colLen - Lsize - 1)) {
+        outIndex[g] = nan("");
+        outValue[g] = nan("");
+    } else {
+        outIndex[g] = (double) position;
+        outValue[g] = sign * mmx;
+    }
+#undef T2AT
+}
+
+#define CUBLAS_CHECK(call)                                                \
+    do {                                                                  \
+        cublasStatus_t st__ = (call);                                     \
+        if (st__ != CUBLAS_STATUS_SUCCESS) {                              \
+            error("cuBLAS error in %s at line %d (status %d)", __FILE__,  \
+                  __LINE__, (int) st__);                                  \
+        }                                                                 \
+    } while (0)
+
+/* grids: nRow x colLen x P array; M: (2*colLen-1) x colLen smoother
+ * matrix; LsizeS, isMaxS: scalar numerics.  Returns list(index, value),
+ * each a numeric vector of length nRow * P (NaN -> NA). */
+extern "C" SEXP wccpeakpick_cuda_batch(SEXP grids, SEXP M, SEXP LsizeS, SEXP isMaxS) {
+    if (!isReal(grids) || !isReal(M)) {
+        error("grids and M must be numeric.");
+    }
+    SEXP gDims = getAttrib(grids, R_DimSymbol);
+    if (isNull(gDims) || LENGTH(gDims) != 3) {
+        error("grids must be a 3-dimensional array.");
+    }
+    long nRow = INTEGER(gDims)[0];
+    long colLen = INTEGER(gDims)[1];
+    long P = INTEGER(gDims)[2];
+    long m = 2 * colLen - 1;
+    if (nrows(M) != m || ncols(M) != colLen) {
+        error("M must be a (2*colLen-1) x colLen matrix.");
+    }
+    long Lsize = (long) REAL(LsizeS)[0];
+    int findMax = (int) REAL(isMaxS)[0];
+
+    SEXP outIndexS = PROTECT(allocVector(REALSXP, nRow * P));
+    SEXP outValueS = PROTECT(allocVector(REALSXP, nRow * P));
+
+    double *dGrids, *dM, *dT2, *dIdx, *dVal;
+    CUDA_CHECK(cudaMalloc(&dGrids, (size_t) nRow * colLen * P * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&dM, (size_t) m * colLen * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&dT2, (size_t) nRow * m * P * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&dIdx, (size_t) nRow * P * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&dVal, (size_t) nRow * P * sizeof(double)));
+
+    CUDA_CHECK(cudaMemcpy(dGrids, REAL(grids), (size_t) nRow * colLen * P * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dM, REAL(M), (size_t) m * colLen * sizeof(double), cudaMemcpyHostToDevice));
+
+    /* T2[p] (nRow x m) = grid[p] (nRow x colLen) * M^T (colLen x m) */
+    cublasHandle_t handle;
+    CUBLAS_CHECK(cublasCreate(&handle));
+    const double one = 1.0, zero = 0.0;
+    CUBLAS_CHECK(cublasDgemmStridedBatched(handle,
+        CUBLAS_OP_N, CUBLAS_OP_T,
+        (int) nRow, (int) m, (int) colLen,
+        &one,
+        dGrids, (int) nRow, (long long) nRow * colLen,
+        dM, (int) m, 0,
+        &zero,
+        dT2, (int) nRow, (long long) nRow * m,
+        (int) P));
+    cublasDestroy(handle);
+
+    long total = nRow * P;
+    long nBlocks = (total + TPB - 1) / TPB;
+    peakSearchKernel<<<(unsigned) nBlocks, TPB>>>(dT2, nRow, colLen, P, Lsize, findMax,
+                                                  dIdx, dVal);
+    CUDA_CHECK(cudaGetLastError());
+
+    CUDA_CHECK(cudaMemcpy(REAL(outIndexS), dIdx, (size_t) total * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(REAL(outValueS), dVal, (size_t) total * sizeof(double), cudaMemcpyDeviceToHost));
+
+    cudaFree(dVal); cudaFree(dIdx); cudaFree(dT2); cudaFree(dM); cudaFree(dGrids);
+
+    double *oi = REAL(outIndexS);
+    double *ov = REAL(outValueS);
+    for (long j = 0; j < total; j++) {
+        if (isnan(oi[j])) { oi[j] = NA_REAL; ov[j] = NA_REAL; }
+    }
+
+    SEXP res = PROTECT(allocVector(VECSXP, 2));
+    SET_VECTOR_ELT(res, 0, outIndexS);
+    SET_VECTOR_ELT(res, 1, outValueS);
+    UNPROTECT(3);
+    return res;
+}

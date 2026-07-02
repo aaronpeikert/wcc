@@ -24,4 +24,10 @@ SEXP windcrosscum_cuda_batch(SEXP seriesArray1, SEXP seriesArray2, SEXP pairs,
     return R_NilValue;
 }
 
+SEXP wccpeakpick_cuda_batch(SEXP grids, SEXP M, SEXP LsizeS, SEXP isMaxS) {
+    error("CUDA support was not built into this installation of wcc. "
+          "Reinstall with CUDA_HOME set and nvcc available, or use method=\"cumc\".");
+    return R_NilValue;
+}
+
 #endif
