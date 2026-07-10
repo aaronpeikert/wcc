@@ -23,7 +23,8 @@ This function calculates a windowed cross correlation matrix from two time serie
 }
 
 \usage{
-wccCalc(inSeries1, inSeries2, wMax=50, tMax=50, wInc=1, tInc=1, windcross=TRUE) 
+wccCalc(inSeries1, inSeries2, wMax=50, tMax=50, wInc=1, tInc=1,
+        method=c("c", "cumr", "cumc", "r"), ...)
 }
 
 \arguments{
@@ -33,7 +34,8 @@ wccCalc(inSeries1, inSeries2, wMax=50, tMax=50, wInc=1, tInc=1, windcross=TRUE)
 \item{tMax}{The maximum number of samples to lag the windows (default=50).  The cross correlation is calculated for windows that are time lagged against each other, allowing for processes than require some time to evolve.  For instance, if the two time series are from motion capture of two individuals conversing with one another, the speaker's movements are likely to occur prior to the responses of the listener.  tMax should be set to be greater than the number of samples that represents the maximum time lag that is likely to occur. }
 \item{wInc}{The number of samples incremented between successive windows  (default=1).  This is most often set to 1.  If the sample rate is very high and the time series is long, wInc may be increased.  However, \code{wccCalc}'s maximum sensitivity to nonstationary change in the time series occurs when wInc is 1.}
 \item{tInc}{The number of samples incremented between successive lags  (default=1).  This is most often set to 1.  If the sample rate is high and the maximum lag is high then tInc may be increased.  However, \code{wccCalc}'s maximum sensitivity to changes in lags occurs when the tInc is set to 1.}
-\item{windcross}{The default (windcross=TRUE) indicates that the compiled windcross binary is used.  If windcross=FALSE uses native R code to calculate the windowed cross correlation. The native R code is the most portable across many machines and operating systems.  However, the compiled windcross library runs about 2 times faster, so if the binary is available on your machine, it is recommended.}
+\item{method}{Backend selector for the windowed cross correlation.  \code{"c"} (default) calls the original compiled \code{windcross} binary; \code{"r"} is the original pure-R loop.  \code{"cumc"} uses a cumulative-sum C backend that computes each cell in O(1) from prefix sums, giving O(n * nLags) cost independent of window size; \code{"cumr"} is the pure-R reference for that algorithm.  The \code{cum*} methods do not support missing data: any NA in the input is an error.  When \code{tInc > 1} the \code{cum*} methods use lags \code{0, tInc, 2*tInc, ..., tMax}, matching \code{"c"}; the legacy \code{"r"} method shifts by the column index instead.}
+\item{...}{Reserved for the deprecated \code{windcross=TRUE/FALSE} argument, mapped to \code{method="c"} / \code{method="r"} with a warning.}
 }
 
 \details{
@@ -55,6 +57,6 @@ Boker, S. M., Rotondo, J. L., Xu, M., & King, K. (2002). Windowed cross-correlat
 tSeries1 <- sin(c(1:1000)/10) + rnorm(1000, mean=0, sd=.5)
 tSeries2 <- sin(c(1:1000)/15) + rnorm(1000, mean=0, sd=.5)
 wccCalcOut <- wccCalc(inSeries1=tSeries1, inSeries2=tSeries2, wMax=50, tMax=50, wInc=1,
-     tInc=1, windcross=FALSE)
+     tInc=1, method="r")
 
 }

@@ -32,7 +32,15 @@
 
 
 wccFindDyadParam <- function(inArray1=NA, inArray2=NA, wMaxvector=c(50), tMaxvector=c(50), wIncvector=c(1), tIncvector=c(1),
-                             Lsizevector=c(8), pspanvector=c(.25), type="Max", nSurrogates=NA, samplespersecond=1, windcross=TRUE, embedD=9) {
+                             Lsizevector=c(8), pspanvector=c(.25), type="Max", nSurrogates=NA, samplespersecond=1, method=c("c", "cumr", "cumc", "r"), embedD=9, ...) {
+    # Deprecation: allow old windcross argument
+    dots <- list(...)
+    if ("windcross" %in% names(dots)) {
+        warning("Argument 'windcross' is deprecated; use method=\"c\" or method=\"r\" instead.")
+        method <- if (isTRUE(dots$windcross)) "c" else "r"
+    } else {
+        method <- match.arg(method)
+    }
      #Note that wccAggNames must match the definition in wccAggregate, wccFindDyadParam and wccSurrogateDyads
      wccAggNames <- c("wMax", "tMax", "wInc", "tInc", "Lsize", "pspan", "type", "samples", "windows", 
                      "pctMissing", "pctMissingWindows", "maxMean", "maxVar", "totalMean", "totalVar", "zeroLagMean", 'zeroLagVar', 
@@ -65,24 +73,65 @@ wccFindDyadParam <- function(inArray1=NA, inArray2=NA, wMaxvector=c(50), tMaxvec
     wccTestNames <- c(wccAggNames, "maxMeanKS", "maxVarKS", "totalMeanKS", "totalVarKS", "zeroLagMeanKS", 'zeroLagVarKS', "lagMeanKS", "lagVaKSr", "dlagMeanKS", "dlagVaKSr", "d2lagMeanKS", "d2lagVaKSr",
      "maxMeanQdiff", "maxVarQdiff", "totalMeanQdiff", "totalVarQdiff", "zeroLagMeanQdiff", 'zeroLagVarQdiff', "lagMeanQdiff", "lagVarQdiff", "dlagMeanQdiff", "dlagVarQdiff", "d2lagMeanQdiff", "d2lagVarQdiff")
 
-    totalTests <- length(wIncvector) * length(wMaxvector) * length(tMaxvector) * length(tIncvector) * length(Lsizevector) * length(pspanvector) 
-    testFrame <- data.frame(matrix(NA, nrow=totalTests, ncol=length(wccAggNames))) 
+    totalTests <- length(wIncvector) * length(wMaxvector) * length(tMaxvector) * length(tIncvector) * length(Lsizevector) * length(pspanvector)
+    testFrame <- data.frame(matrix(NA, nrow=totalTests, ncol=length(wccAggNames)))
     names(testFrame) <- wccAggNames
+    nDyads <- dim(inArray1)[1]
+
+    # Batched path: surrogate pairings are drawn once and reused for every
+    # parameter combination; real dyads and surrogates are computed together
+    # in a single wccCalcBatch call per (wInc, wMax, tMax, tInc) combination.
+    useBatch <- method %in% c("cumc")
+    if (useBatch) {
+        if (anyNA(inArray1) || anyNA(inArray2)) {
+            stop(paste0("Warning: method \"", method, "\" does not support missing data. Use method=\"c\" or method=\"r\"."))
+        }
+        surrogatePairs <- matrix(NA_integer_, nrow=nSurrogates, ncol=2)
+        for (s in 1:nSurrogates) {
+            j <- sample.int(nDyads, 1)
+            k <- j
+            while (k == j) {
+                k <- sample.int(nDyads, 1)
+            }
+            surrogatePairs[s,] <- c(j, k)
+        }
+        allPairs <- rbind(cbind(1:nDyads, 1:nDyads), surrogatePairs)
+    }
+
     testIndex <- 1
     for(testwInc in wIncvector) {
         for(testwMax in wMaxvector) {
             for(testtMax in tMaxvector) {
                 for(testtInc in tIncvector) {
+                    if (useBatch) {
+                        batchStart <- Sys.time()
+                        wccGrids <- wccCalcBatch(inArray1, inArray2, pairs=allPairs, wMax=testwMax, tMax=testtMax,
+                                wInc=testwInc, tInc=testtInc, method=method)
+                    }
                     for(testLsize in Lsizevector) {
                         for(testpspan in pspanvector) {
                             message(paste0("Parameter Test ", testIndex, " of ", totalTests))
-                            realFrame <- data.frame(matrix(NA, nrow=dim(inArray1)[1], ncol=length(wccAggNames)))  
+                            realFrame <- data.frame(matrix(NA, nrow=dim(inArray1)[1], ncol=length(wccAggNames)))
                             names(realFrame) <- wccAggNames
-                            surrogateFrame <- wccSurrogateDyads(inArray1=inArray1, inArray2=inArray2, wInc=testwInc, wMax=testwMax, tMax=testtMax, 
-                                    tInc=testtInc, Lsize=testLsize, pspan=testpspan, type=type, nSurrogates=nSurrogates, windcross=windcross, embedD=embedD)
+                            if (useBatch) {
+                                aggFrame <- do.call(rbind, lapply(seq_len(dim(wccGrids)[3]), function(p) {
+                                    wccAggregateGrid(wccGrids[,,p], wMax=testwMax, tMax=testtMax, wInc=testwInc, tInc=testtInc,
+                                        Lsize=testLsize, pspan=testpspan, type=type, samplespersecond=samplespersecond,
+                                        embedD=embedD, nSamples=dim(inArray1)[2], pctmissing=0, startTime=batchStart)
+                                }))
+                                names(aggFrame) <- wccAggNames
+                                realFrame[,] <- aggFrame[1:nDyads,]
+                                surrogateFrame <- aggFrame[(nDyads+1):(nDyads+nSurrogates),]
+                            }
+                            else {
+                                surrogateFrame <- wccSurrogateDyads(inArray1=inArray1, inArray2=inArray2, wInc=testwInc, wMax=testwMax, tMax=testtMax,
+                                        tInc=testtInc, Lsize=testLsize, pspan=testpspan, type=type, nSurrogates=nSurrogates, method=method, embedD=embedD)
+                            }
                             for(i in 1:dim(inArray1)[1]) {
-                                realFrame[i,] <- wccAggregate(inSeries1=inArray1[i,], inSeries2=inArray2[i,], wInc=testwInc, wMax=testwMax, tMax=testtMax, 
-                                    tInc=testtInc, Lsize=testLsize, pspan=testpspan, type=type, windcross=windcross)
+                                if (!useBatch) {
+                                    realFrame[i,] <- wccAggregate(inSeries1=inArray1[i,], inSeries2=inArray2[i,], wInc=testwInc, wMax=testwMax, tMax=testtMax,
+                                        tInc=testtInc, Lsize=testLsize, pspan=testpspan, type=type, method=method)
+                                }
                                 realFrame$maxMean[i] <- sum(surrogateFrame$maxMean > realFrame$maxMean[i]) / nSurrogates
                                 realFrame$maxVar[i] <- sum(surrogateFrame$maxVar > realFrame$maxVar[i]) / nSurrogates
                                 realFrame$totalMean[i] <- sum(surrogateFrame$totalMean > realFrame$totalMean[i]) / nSurrogates

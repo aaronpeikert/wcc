@@ -64,7 +64,7 @@ for(i in 1:10) {
 wMaxVec <- c(50,100)
 tMaxVec <- c(25,50)
 wccFDPout <- wccFindDyadParam(inArray1=array1, inArray2=array2, wMaxvector=wMaxVec,
-    tMaxvector=tMaxVec, nSurrogates=30, samplespersecond=1, windcross=FALSE)
+    tMaxvector=tMaxVec, nSurrogates=30, samplespersecond=1, method="r")
 # Plot a heatmap
 wccHeatmap(xparam=wccFDPout$wMax, yparam=wccFDPout$tMax, aggstat=wccFDPout$maxMean,
     xlabel="Window Max", ylabel="Max Lag")

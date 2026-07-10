@@ -55,7 +55,7 @@ Boker, S. M., Rotondo, J. L., Xu, M., & King, K. (2002). Windowed cross-correlat
 tSeries1 <- sin(c(1:1000)/10) + rnorm(1000, mean=0, sd=.5)
 tSeries2 <- sin(c(1:1000)/15) + rnorm(1000, mean=0, sd=.5)
 wccCalcOut <- wccCalc(inSeries1=tSeries1, inSeries2=tSeries2, wMax=50, tMax=50, wInc=1,
-     tInc=1, windcross=FALSE)
+     tInc=1, method="r")
 
 #Calculate the peak picking vectors
 wccPeakPick(wccCalcOut, Lsize=8, pspan=.25, type="Max")
