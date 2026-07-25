@@ -23,13 +23,14 @@
  * Missing data is not supported; the R wrappers reject NA input.
  */
 
-#include <R.h>
-#include <Rinternals.h>
 #include <math.h>
 
 #ifdef _OPENMP
 #include <omp.h>
 #endif
+
+#include <R.h>
+#include <Rinternals.h>
 
 /* Compute one output column (signed lag) for one pair.
  * x, y: centered series (length n).

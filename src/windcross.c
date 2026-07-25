@@ -17,7 +17,7 @@ SEXP windcross(SEXP inSeries1, SEXP inSeries2, SEXP wMax, SEXP tMax, SEXP wInc, 
     }
 
     R_xlen_t maxRowLen = XLENGTH(inSeries1);
-    R_xlen_t maxRowLen2 = XLENGTH(inSeries2);
+    // R_xlen_t maxRowLen2 = XLENGTH(inSeries2);
 
     // Assume wMax, tMax, wInc, and tInc are scalar numeric parameters
     int windowSize = REAL(wMax)[0];
@@ -26,10 +26,10 @@ SEXP windcross(SEXP inSeries1, SEXP inSeries2, SEXP wMax, SEXP tMax, SEXP wInc, 
     int lagIncrement = REAL(tInc)[0];
 
     // Create an nRow-by-nCol numeric matrix
-    int tStart = windowSize + maxLag - 1;
+    // int tStart = windowSize + maxLag - 1;
 	int nRow = floor((maxRowLen - maxLag - windowSize) / windowIncrement);
 	int nCol = (floor(maxLag / lagIncrement) * 2) + 1;
-    int centerCol = (floor(maxLag / lagIncrement)) + 1;
+    // int centerCol = (floor(maxLag / lagIncrement)) + 1;
     SEXP corResult = PROTECT(allocMatrix(REALSXP, nRow, nCol));
     double *tempResult = REAL(corResult);
     double *person1InputVector = REAL(inSeries1);
