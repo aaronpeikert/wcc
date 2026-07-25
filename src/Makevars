@@ -1,0 +1,7 @@
+# NOTE: because this file mentions OBJECTS, R does not generate its own
+# object list, so it must be defined here.
+OBJECTS = corr.o init.o windcross.o windcrosscum.o
+
+# OpenMP for the batched pair loop in windcrosscum.c.
+PKG_CFLAGS = $(SHLIB_OPENMP_CFLAGS)
+PKG_LIBS = $(SHLIB_OPENMP_CFLAGS)

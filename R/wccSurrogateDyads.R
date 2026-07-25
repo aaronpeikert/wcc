@@ -32,7 +32,15 @@
 
 
 
-wccSurrogateDyads <- function(inArray1=NA, inArray2=NA, wMax=50, tMax=50, wInc=1, tInc=1, Lsize=8, pspan=.25, type="Max", nSurrogates=NA, windcross=TRUE, embedD=9) {
+wccSurrogateDyads <- function(inArray1=NA, inArray2=NA, wMax=50, tMax=50, wInc=1, tInc=1, Lsize=8, pspan=.25, type="Max", nSurrogates=NA, method=c("c", "cumr", "cumc", "r"), embedD=9, ...) {
+    # Deprecation: allow old windcross argument
+    dots <- list(...)
+    if ("windcross" %in% names(dots)) {
+        warning("Argument 'windcross' is deprecated; use method=\"c\" or method=\"r\" instead.")
+        method <- if (isTRUE(dots$windcross)) "c" else "r"
+    } else {
+        method <- match.arg(method)
+    }
     #Note that wccAggNames must match the definition in wccAggregate, wccFindDyadParam and wccSurrogateDyads
     wccAggNames <- c("wMax", "tMax", "wInc", "tInc", "Lsize", "pspan", "type", "samples", "windows", 
                     "pctMissing", "pctMissingWindows", "maxMean", "maxVar", "totalMean", "totalVar", "zeroLagMean", 'zeroLagVar', 
@@ -71,7 +79,7 @@ wccSurrogateDyads <- function(inArray1=NA, inArray2=NA, wMax=50, tMax=50, wInc=1
         }
         message(paste0("Iteration ", i, " of ", nSurrogates))
         surrogateFrame[i,] <- wccAggregate(inSeries1=inArray1[j,], inSeries2=inArray2[k,], wMax=wMax, tMax=tMax, wInc=wInc, 
-            tInc=tInc, Lsize=Lsize, pspan=pspan, type=type, windcross=windcross, embedD=embedD)
+            tInc=tInc, Lsize=Lsize, pspan=pspan, type=type, method=method, embedD=embedD)
     }
     return(surrogateFrame)
 }

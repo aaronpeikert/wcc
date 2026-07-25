@@ -57,7 +57,16 @@
 # ---------------------------------------------------------------------
 
 
-wccAggregate <- function(inSeries1=NA, inSeries2=NA, wMax=50, tMax=50, wInc=1, tInc=1, Lsize=8, pspan=.25, type="Max", samplespersecond=1, windcross=TRUE, embedD=9) {
+wccAggregate <- function(inSeries1=NA, inSeries2=NA, wMax=50, tMax=50, wInc=1, tInc=1, Lsize=8, pspan=.25, type="Max", samplespersecond=1, method=c("c", "cumr", "cumc", "r"), embedD=9, ...) {
+
+    # Deprecation: allow old windcross argument
+    dots <- list(...)
+    if ("windcross" %in% names(dots)) {
+        warning("Argument 'windcross' is deprecated; use method=\"c\" or method=\"r\" instead.")
+        method <- if (isTRUE(dots$windcross)) "c" else "r"
+    } else {
+        method <- match.arg(method)
+    }
 
     #Note that wccAggNames must match the definition in wccFindDyadParam and wccSurrogateDyads
     wccAggNames <- c("wMax", "tMax", "wInc", "tInc", "Lsize", "pspan", "type", "samples", "windows", 
@@ -93,8 +102,22 @@ wccAggregate <- function(inSeries1=NA, inSeries2=NA, wMax=50, tMax=50, wInc=1, t
     if (!is.numeric(pspan) | pspan < .05  ) {
         stop(paste0("Warning: tMax must be a numeric greater than 0.05."))
     }
-    wccOut <- wccCalc(inSeries1, inSeries2, wMax=wMax, tMax=tMax, wInc=wInc, tInc=tInc, windcross=windcross)
+    wccOut <- wccCalc(inSeries1, inSeries2, wMax=wMax, tMax=tMax, wInc=wInc, tInc=tInc, method=method)
     pctmissing <- sum(is.na(c(inSeries1,inSeries2)))/(2*length(inSeries1))
+    wccAgg <- wccAggregateGrid(wccOut, wMax=wMax, tMax=tMax, wInc=wInc, tInc=tInc, Lsize=Lsize, pspan=pspan,
+            type=type, samplespersecond=samplespersecond, embedD=embedD,
+            nSamples=length(inSeries1), pctmissing=pctmissing, startTime=startTime)
+    return(wccAgg)
+}
+
+# ----------------------------------
+# Post-processing of one WCC grid into the aggregate statistics row.
+# Shared by wccAggregate (single dyad) and the batched path in
+# wccFindDyadParam, which applies it to each slab of a wccCalcBatch result.
+
+wccAggregateGrid <- function(wccOut, wMax, tMax, wInc, tInc, Lsize, pspan, type,
+                             samplespersecond, embedD, nSamples, pctmissing,
+                             startTime=Sys.time()) {
     pctmissingwindows <- sum(is.na(wccOut[,2]))/dim(wccOut)[1]
     wccOut[is.na(wccOut)] <- 0
     ppOut <- wccPeakPick(wccOut, Lsize=Lsize, pspan=pspan, type=type)
@@ -108,7 +131,7 @@ wccAggregate <- function(inSeries1=NA, inSeries2=NA, wMax=50, tMax=50, wInc=1, t
     if (type=="Min") {
         ttype <- -1
     }
-    wccAgg <- data.frame(        
+    wccAgg <- data.frame(
             wInc=wInc,
             wMax=wMax,
             tMax=tMax,
@@ -116,7 +139,7 @@ wccAggregate <- function(inSeries1=NA, inSeries2=NA, wMax=50, tMax=50, wInc=1, t
             Lsize=Lsize,
             pspan=pspan,
             type = ttype,
-            samples=length(inSeries1),
+            samples=nSamples,
             windows=dim(wccOut)[1],
             pctmissing=pctmissing,
             pctmissingwindows=pctmissingwindows,
@@ -133,6 +156,6 @@ wccAggregate <- function(inSeries1=NA, inSeries2=NA, wMax=50, tMax=50, wInc=1, t
             d2lagMean=mean(PPderivs[,3], na.rm=TRUE),
             d2lagVar=var(PPderivs[,3], na.rm=TRUE),
             elapsedSeconds= Sys.time()-startTime
-        )    
+        )
     return(wccAgg)
 }
